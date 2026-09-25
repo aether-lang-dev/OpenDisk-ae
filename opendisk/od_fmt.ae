@@ -1,0 +1,174 @@
+// od_fmt.ae — OpenDisk's number formatting, the same on every platform.
+//
+// OpenDisk (macOS) uses Foundation's ByteCountFormatter in `.file` style,
+// which is DECIMAL (1 KB = 1000 bytes) with adaptive precision: KB shows no
+// decimals, MB one, GB and TB two, and trailing zeros are dropped. Zero is
+// "Zero KB". This reproduces that with integer arithmetic so Linux, macOS
+// and Windows print identical strings (no locale or libc printf drift).
+
+exports (file_size, decimal_no_fraction, scan_duration, grouped, pct1, plural_items)
+
+import std.string
+
+const KB: long = 1000
+const MB: long = 1000000
+const GB: long = 1000000000
+const TB: long = 1000000000000
+
+// "<whole>.<frac>" from a value scaled by 10^places, trailing zeros dropped.
+// scaled=150, places=2 -> "1.5"; scaled=100, places=2 -> "1".
+fixed(scaled: long, places: int) -> string {
+    long div = 1
+    i = 0
+    while i < places {
+        div = div * 10
+        i = i + 1
+    }
+    long whole = scaled / div
+    long frac = scaled - whole * div
+    if frac == 0 { return string.from_long(whole) }
+    // Render the fraction with its leading zeros, then drop trailing zeros.
+    digits = string.from_long(frac)
+    while string.length(digits) < places {
+        digits = string.concat("0", digits)
+    }
+    while string.ends_with(digits, "0") == 1 {
+        digits = string.substring(digits, 0, string.length(digits) - 1)
+    }
+    return string.concat(string.from_long(whole), string.concat(".", digits))
+}
+
+// Round bytes/unit to `places` decimals, half up, as a scaled integer.
+scaled_round(bytes: long, unit: long, places: int) -> long {
+    long mul = 1
+    i = 0
+    while i < places {
+        mul = mul * 10
+        i = i + 1
+    }
+    // (bytes * mul + unit/2) / unit, without overflowing for huge sizes:
+    // split bytes into whole units and remainder first.
+    long whole = bytes / unit
+    long rem = bytes - whole * unit
+    return whole * mul + (rem * mul + unit / 2) / unit
+}
+
+places_for(unit: long) -> int {
+    if unit == MB { return 1 }
+    if unit == GB { return 2 }
+    if unit == TB { return 2 }
+    return 0
+}
+
+unit_label(unit: long) -> string {
+    if unit == KB { return "KB" }
+    if unit == MB { return "MB" }
+    if unit == GB { return "GB" }
+    return "TB"
+}
+
+next_unit(unit: long) -> long {
+    if unit == KB { return MB }
+    if unit == MB { return GB }
+    if unit == GB { return TB }
+    return 0
+}
+
+// file_size(1024) = "1 KB", file_size(1500000) = "1.5 MB", 0 = "Zero KB".
+file_size(bytes: long) -> string {
+    if bytes <= 0 { return "Zero KB" }
+    if bytes == 1 { return "1 byte" }
+    if bytes < KB { return string.concat(string.from_long(bytes), " bytes") }
+    long unit = KB
+    if bytes >= TB { unit = TB }
+    else if bytes >= GB { unit = GB }
+    else if bytes >= MB { unit = MB }
+    places = places_for(unit)
+    long s = scaled_round(bytes, unit, places)
+    // Rounding can carry into the next unit: 999,999 bytes is "1 MB".
+    long limit = 1000
+    i = 0
+    while i < places {
+        limit = limit * 10
+        i = i + 1
+    }
+    if s >= limit {
+        nu = next_unit(unit)
+        if nu != 0 {
+            unit = nu
+            places = places_for(unit)
+            s = scaled_round(bytes, unit, places)
+        }
+    }
+    return string.concat(fixed(s, places), string.concat(" ", unit_label(unit)))
+}
+
+// The device list's capacity format: GB or TB only, fraction TRUNCATED
+// (OpenDisk deletes it with a regex): 1.5 TB -> "1 TB", 500 GB -> "500 GB".
+decimal_no_fraction(bytes: long) -> string {
+    if bytes < 0 { bytes = 0 }
+    if bytes >= TB {
+        // Round to two places as ByteCountFormatter would, then truncate.
+        long t = scaled_round(bytes, TB, 2) / 100
+        return string.concat(string.from_long(t), " TB")
+    }
+    long g = scaled_round(bytes, GB, 2) / 100
+    if g >= 1000 { return "1 TB" }
+    return string.concat(string.from_long(g), " GB")
+}
+
+// "Scanned in 500 ms" / "Scanned in 3.2 seconds" / "Scanned in 1:05".
+scan_duration(secs: float) -> string {
+    if secs < 1.0 {
+        long ms = (secs * 1000.0 + 0.5) as long
+        return "Scanned in ${ms} ms"
+    }
+    if secs < 60.0 {
+        long tenths = (secs * 10.0 + 0.5) as long
+        long w = tenths / 10
+        long f = tenths - w * 10
+        return "Scanned in ${w}.${f} seconds"
+    }
+    long total = secs as long
+    long m = total / 60
+    long sec = total - m * 60
+    pad = ""
+    if sec < 10 { pad = "0" }
+    return "Scanned in ${m}:${pad}${sec}"
+}
+
+// 1234567 -> "1,234,567".
+grouped(n: long) -> string {
+    neg = 0
+    if n < 0 {
+        neg = 1
+        n = 0 - n
+    }
+    digits = string.from_long(n)
+    out = ""
+    len = string.length(digits)
+    i = 0
+    while i < len {
+        if i > 0 {
+            if (len - i) % 3 == 0 { out = string.concat(out, ",") }
+        }
+        out = string.concat(out, string.substring(digits, i, i + 1))
+        i = i + 1
+    }
+    if neg == 1 { return string.concat("-", out) }
+    return out
+}
+
+// One decimal place, always shown: 0.4 -> "40.0" when given a fraction.
+pct1(fraction: float) -> string {
+    long tenths = (fraction * 1000.0 + 0.5) as long
+    long w = tenths / 10
+    long f = tenths - w * 10
+    return "${w}.${f}"
+}
+
+// "1 item" / "3 items".
+plural_items(n: long) -> string {
+    if n == 1 { return "1 item" }
+    return string.concat(grouped(n), " items")
+}

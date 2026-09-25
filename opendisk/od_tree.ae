@@ -1,0 +1,318 @@
+// od_tree.ae — OpenDisk's scanned file tree.
+//
+// A node per file or directory. A file's size is its ALLOCATED size on disk
+// (what it really costs), not its logical length; a directory's size is 0
+// until roll_up() sums its children into it. Hard links: the first sighting
+// of a (device, file id) pair carries the bytes, later ones carry 0, so a
+// file linked from two places is counted once (link_seen / link_record).
+//
+// Port of OpenDisk's FileTree (MIT, © 137137137) — a pointer tree rather
+// than the Swift flat arrays, same semantics.
+
+exports (
+    Node, node_new, node_add, child_count, child_at, roll_up, sort_by_size,
+    sort_by_name, sorted_for_display, find_child, node_for_path, path_of,
+    remove_child, is_ancestor_path, last_component, parent_path,
+    LinkSet, links_new, link_claim, count_nodes, last_index
+)
+
+import std.string
+import std.list
+import std.set
+
+extern malloc(size: int) -> ptr
+
+struct Node {
+    name: string,
+    path: string,
+    size: long,
+    is_dir: int,
+    parent: *Node,
+    children: ptr,
+    // 1 once the node is detached (removed, or replaced by a rescan): a
+    // detached node is never reported again (search, chart, roll-up).
+    detached: int
+}
+
+node_new(name: string, path: string, is_dir: int, size: long) -> *Node {
+    n = malloc(sizeof(Node)) as *Node
+    n.name = name
+    n.path = path
+    n.size = size
+    n.is_dir = is_dir
+    n.parent = null as *Node
+    n.children = list.new()
+    n.detached = 0
+    return n
+}
+
+// Attach `c` under `p` (appends; display order comes from sorting).
+node_add(p: *Node, c: *Node) {
+    c.parent = p
+    _ = list.add(p.children, c as ptr)
+}
+
+child_count(n: *Node) -> int { return list.size(n.children) }
+
+child_at(n: *Node, i: int) -> *Node {
+    return list.list_get_raw(n.children, i) as *Node
+}
+
+// Sum every directory's size from its children, bottom-up. Files keep the
+// size the scan gave them. Recursion depth is bounded by path depth.
+roll_up(n: *Node) -> long {
+    if n.is_dir == 0 { return n.size }
+    long total = 0
+    k = list.size(n.children)
+    i = 0
+    while i < k {
+        total = total + roll_up(child_at(n, i))
+        i = i + 1
+    }
+    n.size = total
+    return total
+}
+
+count_nodes(n: *Node) -> int {
+    c = 1
+    k = list.size(n.children)
+    i = 0
+    while i < k {
+        c = c + count_nodes(child_at(n, i))
+        i = i + 1
+    }
+    return c
+}
+
+// ─── Sorting (merge sort over a list of *Node) ────────────────────
+//
+// Two fixed orders, no comparator function values (a fn value passed
+// across modules can be dropped by the compiler's dead-code pass):
+//   by size: size descending, ties by name ascending (OpenDisk's display
+//            order, childrenSortedForDisplay)
+//   by name: case-insensitive name ascending, ties by exact name
+
+// < 0 when a sorts first.
+cmp_size(a: *Node, b: *Node) -> int {
+    if a.size > b.size { return -1 }
+    if a.size < b.size { return 1 }
+    return string.compare(a.name, b.name)
+}
+
+cmp_name(a: *Node, b: *Node) -> int {
+    c = string.compare(string.to_lower(a.name), string.to_lower(b.name))
+    if c != 0 { return c }
+    return string.compare(a.name, b.name)
+}
+
+cmp_by(mode: int, a: *Node, b: *Node) -> int {
+    if mode == 1 { return cmp_name(a, b) }
+    return cmp_size(a, b)
+}
+
+// Stable bottom-up merge sort of `l` in place; mode 0 = size, 1 = name.
+merge_sort(l: ptr, mode: int) {
+    n = list.size(l)
+    if n < 2 { return }
+    tmp = list.new()
+    i = 0
+    while i < n {
+        _ = list.add(tmp, list.list_get_raw(l, i))
+        i = i + 1
+    }
+    width = 1
+    src = l
+    dst = tmp
+    while width < n {
+        lo = 0
+        while lo < n {
+            mid = lo + width
+            if mid > n { mid = n }
+            hi = lo + 2 * width
+            if hi > n { hi = n }
+            a = lo
+            b = mid
+            k = lo
+            while k < hi {
+                take_a = 0
+                if a < mid {
+                    if b >= hi { take_a = 1 }
+                    else {
+                        na = list.list_get_raw(src, a) as *Node
+                        nb = list.list_get_raw(src, b) as *Node
+                        if cmp_by(mode, na, nb) <= 0 { take_a = 1 }
+                    }
+                }
+                if take_a == 1 {
+                    list.list_set(dst, k, list.list_get_raw(src, a))
+                    a = a + 1
+                } else {
+                    list.list_set(dst, k, list.list_get_raw(src, b))
+                    b = b + 1
+                }
+                k = k + 1
+            }
+            lo = hi
+        }
+        t = src
+        src = dst
+        dst = t
+        width = width * 2
+    }
+    // The sorted run ended in `src`; make sure it lands in `l`.
+    if src != l {
+        i = 0
+        while i < n {
+            list.list_set(l, i, list.list_get_raw(src, i))
+            i = i + 1
+        }
+    }
+    list.list_free(tmp)
+}
+
+sort_by_size(l: ptr) { merge_sort(l, 0) }
+sort_by_name(l: ptr) { merge_sort(l, 1) }
+
+// A new list of n's children in display order (size desc, name asc).
+sorted_for_display(n: *Node) -> ptr {
+    out = list.new()
+    k = list.size(n.children)
+    i = 0
+    while i < k {
+        _ = list.add(out, list.list_get_raw(n.children, i))
+        i = i + 1
+    }
+    sort_by_size(out)
+    return out
+}
+
+find_child(n: *Node, name: string) -> *Node {
+    k = list.size(n.children)
+    i = 0
+    while i < k {
+        c = child_at(n, i)
+        if string.equals(c.name, name) == 1 { return c }
+        i = i + 1
+    }
+    return null as *Node
+}
+
+// The node at `path` under `root` (whose path is root.path), or null.
+node_for_path(root: *Node, path: string) -> *Node {
+    if string.equals(path, root.path) == 1 { return root }
+    base = root.path
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    if string.starts_with(path, base) == 0 { return null as *Node }
+    rest = string.substring(path, string.length(base), string.length(path))
+    cur = root
+    while string.length(rest) > 0 {
+        slash = string.index_of(rest, "/")
+        comp = rest
+        if slash >= 0 {
+            comp = string.substring(rest, 0, slash)
+            rest = string.substring(rest, slash + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if string.length(comp) > 0 {
+            nxt = find_child(cur, comp)
+            if nxt == null { return null as *Node }
+            cur = nxt
+        }
+    }
+    return cur
+}
+
+path_of(n: *Node) -> string { return n.path }
+
+// Detach `child` from `p` and subtract its bytes from every ancestor.
+remove_child(p: *Node, child: *Node) -> int {
+    k = list.size(p.children)
+    i = 0
+    while i < k {
+        if child_at(p, i) == child {
+            list.list_remove(p.children, i)
+            child.detached = 1
+            anc = p
+            while anc != null {
+                anc.size = anc.size - child.size
+                anc = anc.parent
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Is `anc` a strict ancestor directory of `path`? ("/a" of "/a/b", not "/ab").
+is_ancestor_path(anc: string, path: string) -> int {
+    base = anc
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    if string.equals(anc, path) == 1 { return 0 }
+    return string.starts_with(path, base)
+}
+
+last_component(path: string) -> string {
+    p = path
+    while string.length(p) > 1 {
+        if string.ends_with(p, "/") == 1 {
+            p = string.substring(p, 0, string.length(p) - 1)
+        } else {
+            break
+        }
+    }
+    if string.equals(p, "/") == 1 { return "/" }
+    i = last_index(p, "/")
+    if i < 0 {
+        // Windows: C:\x\y as well as C:/x/y.
+        j = last_index(p, "\\")
+        if j < 0 { return p }
+        return string.substring(p, j + 1, string.length(p))
+    }
+    return string.substring(p, i + 1, string.length(p))
+}
+
+parent_path(path: string) -> string {
+    i = last_index(path, "/")
+    if i < 0 { return path }
+    if i == 0 { return "/" }
+    return string.substring(path, 0, i)
+}
+
+// ─── Hard-link claims ─────────────────────────────────────────────
+//
+// The (device, file id) pairs already counted, as "dev:ino" keys in a
+// std.set. Only files with more than one link go in.
+
+struct LinkSet {
+    keys: ptr
+}
+
+links_new() -> *LinkSet {
+    s = malloc(sizeof(LinkSet)) as *LinkSet
+    s.keys = set.new()
+    return s
+}
+
+// 1 the first time (dev, ino) is claimed — that sighting carries the
+// bytes — and 0 on every later sighting.
+link_claim(s: *LinkSet, dev: long, ino: long) -> int {
+    if set.add(s.keys, "${dev}:${ino}") { return 1 }
+    return 0
+}
+
+// Index of the last `ch` (one character) in `s`, or -1.
+last_index(s: string, ch: string) -> int {
+    at = -1
+    base = 0
+    rest = s
+    while 1 == 1 {
+        i = string.index_of(rest, ch)
+        if i < 0 { return at }
+        at = base + i
+        base = at + 1
+        rest = string.substring(s, base, string.length(s))
+    }
+    return at
+}

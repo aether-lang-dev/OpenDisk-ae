@@ -1,0 +1,361 @@
+// od_driver.ae — OpenDisk vocabulary for the AetherUIDriver specs, on
+// aether-ui's generic tests/lib/uidriver.ae client: the fixture, the scan wait, the
+// list rows in order, the breadcrumbs, the chart (hover by name through its
+// accessibility description), and the Collector panel.
+//
+// Each spec runs against a FRESH app scanning a FRESH fixture
+// ($OD_FIXTURE, passed to the app as its folder); spec/run.sh builds both.
+// Fixture layout (sizes are logical; the app shows allocated sizes):
+//   Movies/movie.mov        2,000,000
+//   Documents/report.pdf       50,000
+//   Documents/drafts/report-old.pdf  30,000
+//   Music/song.flac           400,000
+//   tiny.txt                       10
+
+exports (
+    fixture_path, fixture_name, wait_for_app, wait_scan_done, list_names, row_of,
+    click_row, crumbs_line, wait_crumbs, text_containing, wait_text, canvas_id,
+    chart_a11y, hover_chart_vb, hover_segment, click_segment_named, click_chart_centre,
+    chart_px_x, chart_px_y, collector_title, collector_sub, widget_visible, button_starting,
+    chart_rgb
+)
+
+import std.string
+import std.list
+import std.math
+import std.os
+import std.os (os_getenv)
+import std.json
+import uidriver
+
+extern sin(x: float) -> float
+extern cos(x: float) -> float
+
+fixture_path() -> string { return os_getenv("OD_FIXTURE") }
+
+fixture_name() -> string {
+    p = fixture_path()
+    i = string.length(p) - 1
+    while i >= 0 {
+        if string.equals(string.substring(p, i, i + 1), "/") == 1 {
+            return string.substring(p, i + 1, string.length(p))
+        }
+        i = i - 1
+    }
+    return p
+}
+
+jstr(w: ptr, name: string) -> string { return uidriver.field_str(w, name) }
+jint(w: ptr, name: string) -> int { return uidriver.field_int(w, name) }
+jbool(w: ptr, name: string) -> int {
+    f = json.json_object_get_raw(w, name)
+    if f == null { return 0 }
+    return json.json_get_bool(f)
+}
+
+// The first visible text widget whose text contains `needle` ("" if none).
+text_containing(needle: string) -> string {
+    body = uidriver.get_body("/widgets?type=text")
+    v, _e = json.parse(body)
+    if v == null { return "" }
+    out = ""
+    n = json.json_array_size(v)
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        t = jstr(w, "text")
+        if jbool(w, "visible") == 1 {
+            if string.contains(t, needle) == 1 {
+                if string.length(out) == 0 { out = t }
+            }
+        }
+        i = i + 1
+    }
+    json.json_free(v)
+    return out
+}
+
+wait_text(needle: string, tries: int) -> int {
+    i = 0
+    while i < tries {
+        if string.length(text_containing(needle)) > 0 { return 1 }
+        sleep(150)
+        i = i + 1
+    }
+    return 0
+}
+
+wait_scan_done(tries: int) -> int { return wait_text("Scanned in", tries) }
+
+wait_for_app() {
+    uidriver.wait_server()
+    uidriver.resize_window(1100, 720)
+    _ = wait_scan_done(60)
+}
+
+// Is widget `id` shown: visible itself and every ancestor visible.
+widget_visible(id: int) -> int {
+    cur = id
+    guard = 0
+    while cur > 0 {
+        if uidriver.widget_bool_by_id(cur, "visible") != 1 { return 0 }
+        cur = uidriver.widget_int_field_by_id(cur, "parent")
+        guard = guard + 1
+        if guard > 64 { return 1 }
+    }
+    return 1
+}
+
+// The listbox: its rows are the hstacks whose parent is the listbox; a
+// row's first text child is the item's name. Names in on-screen order,
+// joined "|".
+list_names() -> string {
+    body = uidriver.get_body("/widgets")
+    v, _e = json.parse(body)
+    if v == null { return "" }
+    // The listbox reports as a plain vstack: the one inside the (only)
+    // scrollview, which holds the folder list.
+    sv = 0
+    n = json.json_array_size(v)
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if string.equals(jstr(w, "type"), "scrollview") == 1 { sv = jint(w, "id") }
+        i = i + 1
+    }
+    lb = 0
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if lb == 0 { if jint(w, "parent") == sv { lb = jint(w, "id") } }
+        i = i + 1
+    }
+    out = ""
+    first = 1
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if jint(w, "parent") == lb {
+            row = jint(w, "id")
+            // first text child of this row
+            j = 0
+            got = 0
+            while j < n {
+                c = json.json_array_get_raw(v, j)
+                if got == 0 {
+                    if jint(c, "parent") == row {
+                        if string.equals(jstr(c, "type"), "text") == 1 {
+                            if first == 0 { out = string.concat(out, "|") }
+                            out = string.concat(out, jstr(c, "text"))
+                            first = 0
+                            got = 1
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    json.json_free(v)
+    return out
+}
+
+// The row hstack holding a text exactly `name` (its parent), or 0.
+row_of(name: string) -> int {
+    lbl = uidriver.widget_id_of("text", name)
+    if lbl == 0 { return 0 }
+    return uidriver.widget_int_field_by_id(lbl, "parent")
+}
+
+click_row(name: string) {
+    r = row_of(name)
+    uidriver.post_ok("/widget/${r}/click", string.concat("click row ", name))
+}
+
+// Breadcrumb buttons joined " > " — the crumb row is the hstack holding
+// the "›" separators; with a single crumb it is the button whose text is
+// the fixture name and whose parent holds no listbox.
+crumbs_line() -> string {
+    body = uidriver.get_body("/widgets")
+    v, _e = json.parse(body)
+    if v == null { return "" }
+    n = json.json_array_size(v)
+    // the crumb container: parent of the (last) button labelled with the
+    // root name that is NOT on the device screen (device rows also carry
+    // a text sibling; crumbs never do)
+    host = 0
+    nm = fixture_name()
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if string.equals(jstr(w, "type"), "button") == 1 {
+            if string.equals(jstr(w, "text"), nm) == 1 {
+                p = jint(w, "parent")
+                has_text_sib = 0
+                j = 0
+                while j < n {
+                    c = json.json_array_get_raw(v, j)
+                    if jint(c, "parent") == p {
+                        if string.equals(jstr(c, "type"), "text") == 1 {
+                            if string.equals(jstr(c, "text"), "›") == 0 { has_text_sib = 1 }
+                        }
+                    }
+                    j = j + 1
+                }
+                if has_text_sib == 0 { host = p }
+            }
+        }
+        i = i + 1
+    }
+    out = ""
+    first = 1
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if host != 0 {
+            if jint(w, "parent") == host {
+                if string.equals(jstr(w, "type"), "button") == 1 {
+                    if first == 0 { out = string.concat(out, " > ") }
+                    out = string.concat(out, jstr(w, "text"))
+                    first = 0
+                }
+            }
+        }
+        i = i + 1
+    }
+    json.json_free(v)
+    return out
+}
+
+wait_crumbs(want: string, tries: int) -> int {
+    i = 0
+    while i < tries {
+        if string.equals(crumbs_line(), want) == 1 { return 1 }
+        sleep(150)
+        i = i + 1
+    }
+    return 0
+}
+
+// ─── The chart ────────────────────────────────────────────────────
+
+canvas_id() -> int { return uidriver.widget_id_of("canvas", "") }
+
+// The chart's viewBox is 500×500, fitted into the canvas widget (meet):
+// scale by the smaller side, centred.
+chart_scale() -> float {
+    cid = canvas_id()
+    w = uidriver.widget_int_field_by_id(cid, "w") as float
+    h = uidriver.widget_int_field_by_id(cid, "h") as float
+    return math.min_float(w, h) / 500.0
+}
+
+chart_px_x(vbx: float) -> float {
+    cid = canvas_id()
+    w = uidriver.widget_int_field_by_id(cid, "w") as float
+    s = chart_scale()
+    return (w - 500.0 * s) / 2.0 + vbx * s
+}
+
+chart_px_y(vby: float) -> float {
+    cid = canvas_id()
+    h = uidriver.widget_int_field_by_id(cid, "h") as float
+    s = chart_scale()
+    return (h - 500.0 * s) / 2.0 + vby * s
+}
+
+chart_a11y() -> string {
+    body = uidriver.get_body("/widget/${canvas_id()}/a11y")
+    v, _e = json.parse(body)
+    if v == null { return "" }
+    d = jstr(v, "description")
+    json.json_free(v)
+    return d
+}
+
+hover_chart_vb(x: float, y: float) {
+    uidriver.post_ok("/canvas/1/move?x=${chart_px_x(x)}&y=${chart_px_y(y)}", "hover chart")
+}
+
+// Ring `depth` (1..5) mid-radius in viewBox units: (500/2 - 10)/6 per ring.
+ring_mid(depth: int) -> float {
+    t = (250.0 - 10.0) / 6.0
+    return (depth as float) * t + t / 2.0
+}
+
+// Walk ring `depth` in 3° steps until the chart describes `name`. Returns
+// the angle (radians) found, or -1.
+hover_segment(name: string, depth: int) -> float {
+    r = ring_mid(depth)
+    k = 0
+    while k < 120 {
+        a = (k as float) * 0.05235987755982988
+        hover_chart_vb(250.0 + r * cos(a), 250.0 + r * sin(a))
+        if string.starts_with(chart_a11y(), string.concat(name, ",")) == 1 { return a }
+        k = k + 1
+    }
+    return 0.0 - 1.0
+}
+
+click_segment_named(name: string, depth: int) -> int {
+    a = hover_segment(name, depth)
+    if a < 0.0 { return 0 }
+    r = ring_mid(depth)
+    x = chart_px_x(250.0 + r * cos(a))
+    y = chart_px_y(250.0 + r * sin(a))
+    uidriver.post_ok("/canvas/1/click?x=${x}&y=${y}", string.concat("click segment ", name))
+    return 1
+}
+
+click_chart_centre() {
+    uidriver.post_ok("/canvas/1/click?x=${chart_px_x(250.0)}&y=${chart_px_y(250.0)}", "click centre")
+}
+
+// ─── The Collector panel ──────────────────────────────────────────
+
+// Its title line: the hint, the total size, "Deleting …" or "Freed …".
+collector_title() -> string {
+    for_hint = text_containing("Drag files here")
+    if string.length(for_hint) > 0 { return for_hint }
+    fr = text_containing("Freed")
+    if string.length(fr) > 0 { return fr }
+    return ""
+}
+
+collector_sub() -> string { return text_containing("collected") }
+
+// The last button whose label starts with `prefix` but is longer than it
+// ("Delete " finds "Delete 2.1 MB", never the plain "Delete").
+button_starting(prefix: string) -> int {
+    body = uidriver.get_body("/widgets?type=button")
+    v, _e = json.parse(body)
+    if v == null { return 0 }
+    found = 0
+    n = json.json_array_size(v)
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        t = jstr(w, "text")
+        if string.starts_with(t, prefix) == 1 {
+            if string.length(t) > string.length(prefix) { found = jint(w, "id") }
+        }
+        i = i + 1
+    }
+    json.json_free(v)
+    return found
+}
+
+// The chart's colour at viewBox (x, y) as 0xRRGGBB, read from the canvas's
+// own rendering (GET /canvas/{id}/pixel), so it works with no display.
+chart_rgb(x: float, y: float) -> int {
+    px = math.round(chart_px_x(x)) as int
+    py = math.round(chart_px_y(y)) as int
+    body = uidriver.get_body("/canvas/1/pixel?x=${px}&y=${py}")
+    v, _e = json.parse(body)
+    if v == null { return 0 - 1 }
+    long p = json.json_get_int(json.json_object_get_raw(v, "pixel")) as long
+    json.json_free(v)
+    if p < 0 { p = p + 4294967296 }
+    return (p % 16777216) as int
+}

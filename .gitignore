@@ -1,0 +1,4 @@
+target/
+.aeb/
+*.o
+*.exe

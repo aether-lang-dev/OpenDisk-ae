@@ -1,0 +1,111 @@
+// OpenDisk protected paths (port of ProtectedPathsTests for macOS, plus the
+// Linux and Windows rule sets the port adds). The OS is a parameter, so all
+// three run on any machine.
+import std.spec
+import std.string
+import od_protected
+import od_protected (reason, normalize)
+
+mac(p: string) -> string { return reason(p, "macos", "/Users/alice") }
+lin(p: string) -> string { return reason(p, "linux", "/home/alice") }
+win(p: string) -> string { return reason(p, "windows", "C:/Users/alice") }
+
+const ROOT: string = "is the disk root and can't be deleted"
+const MAC_SYS: string = "is a macOS system folder and can't be deleted"
+const HOME: string = "is your home folder and can't be deleted"
+const USER: string = "is a user account folder and can't be deleted"
+const VOL: string = "is a mounted volume and can't be deleted"
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "macOS") {
+        spec.it("protects the disk root and every system folder") callback {
+            spec.assert_str_eq(mac("/"), ROOT, "/")
+            spec.assert_str_eq(mac("///"), ROOT, "///")
+            roots = "/System /Library /usr /bin /sbin /private /etc /var /tmp /cores /opt /dev /Network /Volumes /Applications /Users /System/Volumes /System/Applications /System/Library"
+            rest = roots
+            while string.length(rest) > 0 {
+                sp = string.index_of(rest, " ")
+                r = rest
+                if sp >= 0 {
+                    r = string.substring(rest, 0, sp)
+                    rest = string.substring(rest, sp + 1, string.length(rest))
+                } else {
+                    rest = ""
+                }
+                spec.assert_str_eq(mac(r), MAC_SYS, r)
+            }
+        }
+        spec.it("protects user account folders but not what is inside them") callback {
+            spec.assert_str_eq(mac("/Users/bob"), USER, "/Users/bob")
+            spec.assert_str_eq(mac("/Users/Shared"), USER, "/Users/Shared")
+            spec.assert_str_eq(mac("/Users/bob/Downloads"), "", "inside")
+            spec.assert_str_eq(mac("/Users/Shared/Movies/big.mov"), "", "deep inside")
+        }
+        spec.it("protects home and its Library, not their contents") callback {
+            spec.assert_str_eq(mac("/Users/alice"), HOME, "home")
+            spec.assert_str_eq(mac("/Users/alice/"), HOME, "home/")
+            spec.assert_str_eq(mac("~"), HOME, "~")
+            spec.assert_str_eq(mac("/Users/alice/Library"), "is your Library and can't be deleted", "Library")
+            spec.assert_str_eq(mac("~/Library"), "is your Library and can't be deleted", "~/Library")
+            spec.assert_str_eq(mac("/Users/alice/Downloads"), "", "Downloads")
+            spec.assert_str_eq(mac("/Users/alice/Downloads/foo"), "", "Downloads/foo")
+            spec.assert_str_eq(mac("/Users/alice/Library/Caches"), "", "Library/Caches")
+        }
+        spec.it("protects mounted and system volumes, not their contents") callback {
+            spec.assert_str_eq(mac("/Volumes/External"), VOL, "External")
+            spec.assert_str_eq(mac("/Volumes/External SSD"), VOL, "with a space")
+            spec.assert_str_eq(mac("/System/Volumes/Data"), "is a macOS system volume and can't be deleted", "Data")
+            spec.assert_str_eq(mac("/Volumes/External/stuff"), "", "inside a volume")
+        }
+        spec.it("normalizes before judging") callback {
+            spec.assert_str_eq(mac("/System/"), MAC_SYS, "trailing /")
+            spec.assert_str_eq(mac("/System///"), MAC_SYS, "trailing ///")
+            spec.assert_str_eq(mac("/System/../System"), MAC_SYS, "..")
+            spec.assert_str_eq(mac("/usr/./local/.."), MAC_SYS, ". and ..")
+            spec.assert_str_eq(mac("/Users//Shared"), USER, "//")
+            spec.assert_str_eq(mac("/Users/alice/Downloads/.."), HOME, "back up to home")
+            spec.assert_str_eq(mac("/private/tmp"), MAC_SYS, "/private/tmp is /tmp")
+        }
+        spec.it("leaves ordinary paths alone") callback {
+            spec.assert_str_eq(mac("/usr/local/bin/tool"), "", "a tool")
+            spec.assert_str_eq(mac("/Applications/SomeApp.app"), "", "an app")
+            spec.assert_str_eq(mac("/var/folders/xy/T/scratch"), "", "a temp path")
+        }
+    }
+
+    spec.describe(fw, "Linux") {
+        spec.it("protects system folders, home, user folders and mount roots") callback {
+            spec.assert_str_eq(lin("/"), ROOT, "/")
+            spec.assert_str_eq(lin("/usr"), "is a system folder and can't be deleted", "/usr")
+            spec.assert_str_eq(lin("/home/alice"), HOME, "home")
+            spec.assert_str_eq(lin("/home/bob"), USER, "another user")
+            spec.assert_str_eq(lin("/media/usb"), VOL, "/media/usb")
+            spec.assert_str_eq(lin("/run/media/alice/usb"), VOL, "/run/media/…")
+            spec.assert_str_eq(lin("/home/alice/Downloads/x.iso"), "", "a download")
+            spec.assert_str_eq(lin("/home/alice/.cache"), "", "a cache")
+        }
+    }
+
+    spec.describe(fw, "Windows") {
+        spec.it("protects drive roots, Windows folders and home, case-insensitively") callback {
+            spec.assert_str_eq(win("C:\\"), ROOT, "C:\\")
+            spec.assert_str_eq(win("D:/"), ROOT, "D:/")
+            spec.assert_str_eq(win("c:\\windows"), "is a Windows system folder and can't be deleted", "windows")
+            spec.assert_str_eq(win("C:\\Program Files"), "is a Windows system folder and can't be deleted", "Program Files")
+            spec.assert_str_eq(win("C:\\Users\\alice"), HOME, "home")
+            spec.assert_str_eq(win("C:\\Users\\bob"), USER, "another user")
+            spec.assert_str_eq(win("C:\\Users\\alice\\Downloads\\x.zip"), "", "a download")
+        }
+    }
+
+    spec.describe(fw, "normalize") {
+        spec.it("expands ~, resolves . and .., and collapses separators") callback {
+            spec.assert_str_eq(normalize("~/a/./b/../c//", "/h"), "/h/a/c", "posix")
+            spec.assert_str_eq(normalize("C:\\a\\..\\b", "C:/h"), "C:/b", "windows")
+            spec.assert_str_eq(normalize("/..", "/h"), "/", "above root")
+        }
+    }
+    return spec.run_summary(fw)
+}

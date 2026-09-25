@@ -1,0 +1,160 @@
+// od_search.ae — search every scanned file and folder by name.
+//
+// Port of OpenDisk's SearchIndex (MIT, © 137137137). Names are folded once
+// when the index is built (od_text.fold: lowercase + composed accents); the
+// query is folded the same way and split on whitespace. A node matches when
+// EVERY token is a substring of its name. The root itself never matches.
+// Results: the largest RESULT_LIMIT matches, size descending then name;
+// `total` counts every match.
+
+exports (Index, index_build, search, Results, SCOPE_ALL, SCOPE_FOLDERS, SCOPE_FILES,
+    RESULT_LIMIT, index_size)
+
+import std.string
+import std.list
+import std.strarr
+import od_tree
+import od_tree (Node, child_at, sort_by_size)
+import od_text
+
+extern malloc(size: int) -> ptr
+
+const RESULT_LIMIT: int = 500
+const SCOPE_ALL: int = 0
+const SCOPE_FOLDERS: int = 1
+const SCOPE_FILES: int = 2
+
+struct Index {
+    nodes: ptr,
+    folded: ptr,
+    // 1 when built from a partial (still-scanning) tree.
+    partial: int
+}
+
+struct Results {
+    items: ptr,
+    total: int,
+    partial: int
+}
+
+add_subtree(ix: *Index, n: *Node) {
+    k = list.size(n.children)
+    i = 0
+    while i < k {
+        c = child_at(n, i)
+        _ = list.add(ix.nodes, c as ptr)
+        _ = strarr.push_copy(ix.folded, od_text.fold(c.name))
+        if c.is_dir == 1 { add_subtree(ix, c) }
+        i = i + 1
+    }
+}
+
+// Index everything under `root` (not root itself).
+index_build(root: *Node, partial: int) -> *Index {
+    ix = malloc(sizeof(Index)) as *Index
+    ix.nodes = list.new()
+    ix.folded = strarr.new()
+    ix.partial = partial
+    add_subtree(ix, root)
+    return ix
+}
+
+index_size(ix: *Index) -> int { return list.size(ix.nodes) }
+
+// Query tokens, folded, longest first (the longest is the most selective).
+tokens_of(query: string) -> ptr {
+    raw = strarr.new()
+    q = od_text.fold(string.trim(query))
+    rest = string.replace_all(q, "\t", " ")
+    while string.length(rest) > 0 {
+        sp = string.index_of(rest, " ")
+        tok = rest
+        if sp >= 0 {
+            tok = string.substring(rest, 0, sp)
+            rest = string.substring(rest, sp + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if string.length(tok) > 0 { _ = strarr.push_copy(raw, tok) }
+    }
+    // Longest first: take the longest remaining token until none are left
+    // (a query has a handful, so the quadratic walk is nothing).
+    out = strarr.new()
+    while strarr.size(raw) > 0 {
+        n = strarr.size(raw)
+        best = 0
+        j = 1
+        while j < n {
+            if string.length(strarr.get(raw, j)) > string.length(strarr.get(raw, best)) {
+                best = j
+            }
+            j = j + 1
+        }
+        _ = strarr.push_copy(out, strarr.get(raw, best))
+        rest_toks = strarr.new()
+        j = 0
+        while j < n {
+            if j != best { _ = strarr.push_copy(rest_toks, strarr.get(raw, j)) }
+            j = j + 1
+        }
+        raw = rest_toks
+    }
+    return out
+}
+
+matches_all(name: string, toks: ptr) -> int {
+    n = strarr.size(toks)
+    i = 0
+    while i < n {
+        if string.contains(name, strarr.get(toks, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+search(ix: *Index, query: string, scope: int) -> *Results {
+    r = malloc(sizeof(Results)) as *Results
+    r.items = list.new()
+    r.total = 0
+    r.partial = ix.partial
+    toks = tokens_of(query)
+    if strarr.size(toks) == 0 { return r }
+    all = list.new()
+    n = list.size(ix.nodes)
+    i = 0
+    while i < n {
+        node = list.list_get_raw(ix.nodes, i) as *Node
+        keep = 1
+        if node.detached == 1 { keep = 0 }
+        if scope == SCOPE_FOLDERS { if node.is_dir == 0 { keep = 0 } }
+        if scope == SCOPE_FILES { if node.is_dir == 1 { keep = 0 } }
+        if keep == 1 {
+            if matches_all(strarr.get(ix.folded, i), toks) == 1 {
+                if reachable(node) == 1 {
+                    _ = list.add(all, node as ptr)
+                }
+            }
+        }
+        i = i + 1
+    }
+    r.total = list.size(all)
+    sort_by_size(all)
+    m = r.total
+    if m > RESULT_LIMIT { m = RESULT_LIMIT }
+    j = 0
+    while j < m {
+        _ = list.add(r.items, list.list_get_raw(all, j))
+        j = j + 1
+    }
+    return r
+}
+
+// A node removed from the tree (or under a removed one) is not a result.
+reachable(n: *Node) -> int {
+    cur = n
+    while cur != null {
+        if cur.detached == 1 { return 0 }
+        cur = cur.parent
+    }
+    return 1
+}

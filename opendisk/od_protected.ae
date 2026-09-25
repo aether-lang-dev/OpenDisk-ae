@@ -1,0 +1,269 @@
+// od_protected.ae — paths OpenDisk refuses to collect or delete, and why.
+//
+// Port of OpenDisk's ProtectedPaths (MIT, © 137137137). The macOS rules and
+// reason strings are OpenDisk's own; Linux and Windows get the equivalent
+// system-folder sets. The OS is a parameter (not the host's) so every rule
+// set is testable on any machine; reason_here() applies the host's.
+//
+// A path is normalized first: `~` expanded, `.`/`..` resolved, repeated and
+// trailing separators collapsed. Rules apply in order; "" = not protected.
+
+exports (reason, reason_here, normalize, host_os, home_dir)
+
+import std.string
+import std.strarr
+import od_tree
+import std.os
+import std.os (os_getenv)
+
+const SYS_ROOTS_MAC: string = "/System|/Library|/usr|/bin|/sbin|/private|/etc|/var|/tmp|/cores|/opt|/dev|/Network|/Volumes|/Applications|/Users|/System/Volumes|/System/Applications|/System/Library"
+const SYS_ROOTS_LINUX: string = "/bin|/boot|/dev|/etc|/lib|/lib32|/lib64|/libx32|/lost+found|/media|/mnt|/opt|/proc|/root|/run|/sbin|/snap|/srv|/sys|/tmp|/usr|/var|/home"
+const SYS_ROOTS_WIN: string = "C:/Windows|C:/Program Files|C:/Program Files (x86)|C:/ProgramData|C:/Users|C:/Recovery|C:/System Volume Information|C:/$Recycle.Bin"
+
+host_os() -> string {
+    p = os.platform()
+    if string.contains(p, "windows") == 1 { return "windows" }
+    if string.contains(p, "mingw") == 1 { return "windows" }
+    if string.contains(p, "macos") == 1 { return "macos" }
+    if string.contains(p, "darwin") == 1 { return "macos" }
+    return "linux"
+}
+
+home_dir() -> string {
+    h = os_getenv("HOME")
+    if h != null { if string.length(h) > 0 { return h } }
+    u = os_getenv("USERPROFILE")
+    if u != null { return string.replace_all(u, "\\", "/") }
+    return ""
+}
+
+// Normalize like NSString.standardizingPath: expand ~, drop "." segments,
+// resolve "..", collapse "//", strip a trailing "/". Windows paths use "/"
+// after normalization ("C:\a\..\b" -> "C:/b").
+normalize(path: string, home: string) -> string {
+    p = string.replace_all(path, "\\", "/")
+    if string.equals(p, "~") == 1 { p = home }
+    else if string.starts_with(p, "~/") == 1 {
+        p = string.concat(home, string.substring(p, 1, string.length(p)))
+    }
+    drive = ""
+    if string.length(p) >= 2 {
+        if string.equals(string.substring(p, 1, 2), ":") == 1 {
+            drive = string.substring(p, 0, 2)
+            p = string.substring(p, 2, string.length(p))
+        }
+    }
+    absolute = string.starts_with(p, "/")
+    parts = strarr.new()
+    rest = p
+    while string.length(rest) > 0 {
+        slash = string.index_of(rest, "/")
+        seg = rest
+        if slash >= 0 {
+            seg = string.substring(rest, 0, slash)
+            rest = string.substring(rest, slash + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if string.length(seg) == 0 { continue }
+        if string.equals(seg, ".") == 1 { continue }
+        if string.equals(seg, "..") == 1 {
+            // pop: rebuild without the last segment (paths are short)
+            n = strarr.size(parts)
+            if n > 0 {
+                kept = strarr.new()
+                j = 0
+                while j < n - 1 {
+                    _ = strarr.push_copy(kept, strarr.get(parts, j))
+                    j = j + 1
+                }
+                parts = kept
+            }
+            continue
+        }
+        _ = strarr.push_copy(parts, seg)
+    }
+    out = ""
+    n = strarr.size(parts)
+    i = 0
+    while i < n {
+        out = string.concat(out, string.concat("/", strarr.get(parts, i)))
+        i = i + 1
+    }
+    if string.length(out) == 0 {
+        if absolute == 1 { out = "/" }
+    }
+    if absolute == 0 {
+        if string.starts_with(out, "/") == 1 {
+            out = string.substring(out, 1, string.length(out))
+        }
+    }
+    return string.concat(drive, out)
+}
+
+// Case-insensitive on Windows, exact elsewhere.
+same(os: string, a: string, b: string) -> int {
+    if string.equals(os, "windows") == 1 {
+        return string.equals(string.to_lower(a), string.to_lower(b))
+    }
+    return string.equals(a, b)
+}
+
+in_set(os: string, set: string, p: string) -> int {
+    rest = set
+    while string.length(rest) > 0 {
+        bar = string.index_of(rest, "|")
+        item = rest
+        if bar >= 0 {
+            item = string.substring(rest, 0, bar)
+            rest = string.substring(rest, bar + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if same(os, item, p) == 1 { return 1 }
+    }
+    return 0
+}
+
+// Is p a strict ancestor of any member of set?
+ancestor_of_set(os: string, set: string, p: string) -> int {
+    base = p
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    rest = set
+    while string.length(rest) > 0 {
+        bar = string.index_of(rest, "|")
+        item = rest
+        if bar >= 0 {
+            item = string.substring(rest, 0, bar)
+            rest = string.substring(rest, bar + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if string.length(item) > string.length(base) {
+            head = string.substring(item, 0, string.length(base))
+            if same(os, head, base) == 1 { return 1 }
+        }
+    }
+    return 0
+}
+
+is_strict_ancestor(os: string, anc: string, p: string) -> int {
+    base = anc
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    if string.length(p) <= string.length(base) { return 0 }
+    return same(os, string.substring(p, 0, string.length(base)), base)
+}
+
+parent_of(p: string) -> string {
+    i = od_tree.last_index(p, "/")
+    if i <= 0 { return "/" }
+    if i == 2 {
+        // "C:/x" -> "C:/"
+        if string.equals(string.substring(p, 1, 2), ":") == 1 {
+            return string.substring(p, 0, 3)
+        }
+    }
+    return string.substring(p, 0, i)
+}
+
+is_drive_root(p: string) -> int {
+    if string.length(p) == 2 {
+        if string.equals(string.substring(p, 1, 2), ":") == 1 { return 1 }
+    }
+    if string.length(p) == 3 {
+        if string.equals(string.substring(p, 1, 3), ":/") == 1 { return 1 }
+    }
+    return 0
+}
+
+// Why `path` can't be deleted on `os` ("macos" | "linux" | "windows"),
+// with `home` as the user's home folder; "" when it may be.
+reason(path: string, os: string, home: string) -> string {
+    h = normalize(home, home)
+    p = normalize(path, home)
+    if string.equals(os, "windows") == 1 {
+        if is_drive_root(p) == 1 { return "is the disk root and can't be deleted" }
+        if in_set(os, SYS_ROOTS_WIN, p) == 1 {
+            return "is a Windows system folder and can't be deleted"
+        }
+        if string.length(h) > 0 {
+            if same(os, p, h) == 1 { return "is your home folder and can't be deleted" }
+            if same(os, p, string.concat(h, "/AppData")) == 1 {
+                return "is your AppData folder and can't be deleted"
+            }
+        }
+        if same(os, parent_of(p), "C:/Users") == 1 {
+            return "is a user account folder and can't be deleted"
+        }
+        if ancestor_of_set(os, SYS_ROOTS_WIN, p) == 1 {
+            return "contains Windows system files and can't be deleted"
+        }
+        if string.length(h) > 0 {
+            if is_strict_ancestor(os, p, h) == 1 {
+                return "contains your home folder and can't be deleted"
+            }
+        }
+        return ""
+    }
+
+    if string.equals(p, "/") == 1 { return "is the disk root and can't be deleted" }
+    mac = string.equals(os, "macos")
+    if mac == 1 {
+        // NSString.standardizingPath drops the /private of /private/tmp,
+        // /private/var and /private/etc (they are what /tmp etc. link to).
+        if string.starts_with(p, "/private/") == 1 {
+            tail = string.substring(p, 8, string.length(p))
+            t1 = 0
+            if string.equals(tail, "/tmp") == 1 { t1 = 1 }
+            if string.starts_with(tail, "/tmp/") == 1 { t1 = 1 }
+            if string.equals(tail, "/var") == 1 { t1 = 1 }
+            if string.starts_with(tail, "/var/") == 1 { t1 = 1 }
+            if string.equals(tail, "/etc") == 1 { t1 = 1 }
+            if string.starts_with(tail, "/etc/") == 1 { t1 = 1 }
+            if t1 == 1 { p = tail }
+        }
+    }
+    roots = SYS_ROOTS_LINUX
+    sysword = "is a system folder and can't be deleted"
+    containsword = "contains system files and can't be deleted"
+    if mac == 1 {
+        roots = SYS_ROOTS_MAC
+        sysword = "is a macOS system folder and can't be deleted"
+        containsword = "contains macOS system files and can't be deleted"
+    }
+    if in_set(os, roots, p) == 1 { return sysword }
+    if string.length(h) > 0 {
+        if string.equals(p, h) == 1 { return "is your home folder and can't be deleted" }
+        if mac == 1 {
+            if string.equals(p, string.concat(h, "/Library")) == 1 {
+                return "is your Library and can't be deleted"
+            }
+        }
+    }
+    par = parent_of(p)
+    if mac == 1 {
+        if string.equals(par, "/Users") == 1 { return "is a user account folder and can't be deleted" }
+        if string.equals(par, "/Volumes") == 1 { return "is a mounted volume and can't be deleted" }
+        if string.equals(par, "/System/Volumes") == 1 {
+            return "is a macOS system volume and can't be deleted"
+        }
+    } else {
+        if string.equals(par, "/home") == 1 { return "is a user account folder and can't be deleted" }
+        if string.equals(par, "/media") == 1 { return "is a mounted volume and can't be deleted" }
+        if string.equals(par, "/mnt") == 1 { return "is a mounted volume and can't be deleted" }
+        if string.equals(parent_of(par), "/run/media") == 1 {
+            return "is a mounted volume and can't be deleted"
+        }
+    }
+    if ancestor_of_set(os, roots, p) == 1 { return containsword }
+    if string.length(h) > 0 {
+        if is_strict_ancestor(os, p, h) == 1 {
+            return "contains your home folder and can't be deleted"
+        }
+    }
+    return ""
+}
+
+reason_here(path: string) -> string {
+    return reason(path, host_os(), home_dir())
+}

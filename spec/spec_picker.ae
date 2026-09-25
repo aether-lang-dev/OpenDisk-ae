@@ -1,0 +1,59 @@
+// spec_picker.ae — OpenDisk's device screen: Computer with its capacity,
+// a remembered folder (the fixture, seeded by the runner), opening it, and
+// Unmount (with its confirmation) back to the device screen.
+import std.spec
+import std.string
+import od_driver
+import uidriver
+
+screen_shown(label: string) -> int {
+    id = uidriver.widget_id_of("", label)
+    if id == 0 { return 0 }
+    return od_driver.widget_visible(id)
+}
+
+main() {
+    fw = spec.init()
+    uidriver.wait_server()
+    uidriver.resize_window(1100, 720)
+
+    spec.describe(fw, "OpenDisk: device screen") {
+        spec.it("opens on the device screen") callback {
+            spec.assert_true(screen_shown("Select a Disk"), "title shown")
+            spec.assert_false(screen_shown("Unmount"), "analysis hidden")
+        }
+        spec.it("lists Computer with used / total") callback {
+            c = uidriver.widget_id_of("button", "Computer")
+            spec.assert_true(c > 0, "Computer row")
+            cap = od_driver.text_containing(" / ")
+            spec.assert_contains(cap, "B / ", "used / total")
+        }
+        spec.it("offers the remembered folder") callback {
+            spec.assert_true(screen_shown("Recent Folders"), "section shown")
+            spec.assert_true(uidriver.widget_id_of("button", od_driver.fixture_name()) > 0, "its row")
+        }
+        spec.it("scans a remembered folder when chosen") callback {
+            uidriver.click_widget(uidriver.widget_id_of("button", od_driver.fixture_name()))
+            spec.assert_true(od_driver.wait_scan_done(60), "scanned")
+            spec.assert_true(screen_shown("Unmount"), "analysis shown")
+            spec.assert_false(screen_shown("Select a Disk"), "device screen hidden")
+            spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "its contents")
+        }
+        spec.it("asks before unmounting, and returns to the device screen") callback {
+            uidriver.click_widget(uidriver.widget_id_of("button", "Unmount"))
+            spec.assert_true(od_driver.wait_text("It does not eject the disk", 20), "confirmation")
+            // two "Unmount" buttons now: the toolbar's and the card's (last)
+            uidriver.click_widget(uidriver.widget_id_last_of("button", "Unmount"))
+            ok = 0
+            i = 0
+            while i < 20 {
+                if screen_shown("Select a Disk") == 1 { ok = 1 }
+                if ok == 1 { i = 20 }
+                sleep(150)
+                i = i + 1
+            }
+            spec.assert_true(ok, "device screen again")
+        }
+    }
+    return spec.run_summary(fw)
+}

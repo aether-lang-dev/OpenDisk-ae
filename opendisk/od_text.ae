@@ -1,0 +1,9 @@
+// od_text.ae — search-name folding (lowercase + compose Latin accents).
+// The C lives beside this module (od_text.c).
+@source("od_text.c")
+
+exports (fold)
+
+extern od_fold(s: string) -> string
+
+fold(s: string) -> string { return od_fold(s) }

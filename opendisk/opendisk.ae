@@ -1,0 +1,295 @@
+// opendisk.ae — OpenDisk for Linux, macOS and Windows: see what's filling up
+// a disk and clear it out.
+//
+// ─── Provenance & licence ────────────────────────────────────────
+//
+// A port of OpenDisk (https://github.com/137137137/OpenDisk), a macOS
+// SwiftUI app, to Aether UI. OpenDisk is MIT-licensed:
+//
+//   Copyright (c) 2026 137137137
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a
+//   copy of this software and associated documentation files (the
+//   "Software"), to deal in the Software without restriction, including
+//   without limitation the rights to use, copy, modify, merge, publish,
+//   distribute, sublicense, and/or sell copies of the Software, and to
+//   permit persons to whom the Software is furnished to do so, subject to
+//   the following conditions: The above copyright notice and this
+//   permission notice shall be included in all copies or substantial
+//   portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT
+//   WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+//
+// The port (this file and the od_* modules) is under the same licence.
+//
+// ─── What it is ──────────────────────────────────────────────────
+//
+//   DEVICE SCREEN   Computer and each mounted volume (used / total, a usage
+//                   bar), folders scanned before, and "Scan Folder…".
+//   ANALYSIS        a breadcrumb bar; the folder's contents largest first
+//                   (click a folder to go in; Name / Size sort); the rings
+//                   chart (hover for sizes, click a folder ring to go in, the
+//                   centre to go back); the Collector (drop or menu-add things
+//                   to delete, see the total, delete them all); search across
+//                   everything scanned; a status bar (scan progress, disk
+//                   capacity, totals).
+//
+//   Module map:
+//     od_tree / od_scan     the file tree and the scanner (allocated sizes,
+//                           hard links once, never crosses a mount)
+//     od_chart / od_draw    rings chart model + painting
+//     od_search             search by name
+//     od_collector          collect, undo, delete
+//     od_protected          what can never be deleted, per OS
+//     od_devices / od_recent  the device screen
+//     od_view / od_fmt      the screen's rules and text
+//     od_app                state + actions; THIS FILE builds the window
+//
+//   ./target/build/opendisk/bin/opendisk [folder]
+//     (folder via argv[1] or $OPENDISK_SCAN opens straight into a scan)
+//   AetherUIDriver: set AETHER_UI_TEST_PORT to serve the test API on 9222.
+//   Specs: spec/ (spec/run.sh). Unit suites: test/run_tests.sh.
+
+import ui
+import ui (window, vstack, hstack, btn, text, enable_test_server, timer, each,
+    listbox, on_select, splitview, scrollview, textfield, progressbar, spacer,
+    shortcut, context_menu_item, draggable, on_file_drop, canvas_on_click, canvas_on_move,
+    width, height, fill_width, fill_height, set_hidden, a11y_label, a11y_role,
+    style_font_bold, style_font_size, style_text_color, text_truncate)
+import vg.live (vg, canvas_region, region_set_animated)
+import vg
+import vg (view_box, rect)
+import std.string
+import std.list
+import std.strarr
+import std.os
+import std.os (os_getenv, aether_args_count, aether_args_get)
+import od_app
+import od_app (App, app_new, VB)
+import od_view
+import od_view (Row, Crumb, SORT_NAME, SORT_SIZE, row_subline)
+import od_tree
+import od_devices
+import od_devices (Device)
+import od_collector
+import od_collector (Item)
+import od_fmt
+import od_recent
+
+extern aether_ui_canvas_get_widget(canvas_id: int) -> int
+
+main() {
+    a = app_new()
+    a.now = od_app.now_s()
+
+    start = ""
+    if aether_args_count() > 1 { start = aether_args_get(1) }
+    if string.length(start) == 0 {
+        e = os_getenv("OPENDISK_SCAN")
+        if e != null { start = e }
+    }
+
+    window("OpenDisk", 1100, 720) {
+      root = vstack(0) {
+
+        // ── Device screen ────────────────────────────────────────
+        a.picker = vstack(12) {
+            hdr = text("Select a Disk")
+            _b = style_font_size(hdr, 20.0)
+            _bb = style_font_bold(hdr)
+            a.devices = each("v", 6) callback |item: ptr, i: int, parent: int| {
+                d = item as *Device
+                row = hstack(parent, 10)
+                _go = btn(row, d.name) callback { od_app.start_analysis(a, d.path, d.name, d.used) }
+                if d.total > 0 {
+                    _u = text(row, "${od_fmt.decimal_no_fraction(d.used)} / ${od_fmt.decimal_no_fraction(d.total)}")
+                    pb = progressbar(row, od_devices.used_fraction(d))
+                    _w = width(pb, 160)
+                }
+            }
+            a.recents_title = text("Recent Folders")
+            a.recents = each("v", 6) callback |item: ptr, i: int, parent: int| {
+                d = item as *Device
+                row = hstack(parent, 10)
+                _go = btn(row, d.name) callback { od_app.start_analysis(a, d.path, d.name, 0) }
+                loc = text(row, d.path)
+                text_truncate(loc, "middle")
+                context_menu_item(row, "Remove from List") callback {
+                    od_recent_remove(a, d.path)
+                }
+            }
+            hstack(8) {
+                btn("Scan Folder…") callback { od_app.scan_folder(a) }
+            }
+        }
+
+        // ── Analysis screen ──────────────────────────────────────
+        a.analysis = vstack(6) {
+            hstack(8) {
+                btn("Unmount") callback { od_app.ask_unmount(a) }
+                a.title = text("")
+                _tb = style_font_bold(a.title)
+                a.subtitle = text("")
+                spacer()
+                a.search_field = textfield("Search scanned files and folders") callback |q: string| {
+                    od_app.set_query(a, q)
+                }
+                _sw = width(a.search_field, 280)
+                btn("Refresh") callback { od_app.rescan(a) }
+            }
+            a.crumbs = each("h", 3) callback |item: ptr, i: int, parent: int| {
+                c = item as *Crumb
+                if i > 0 { _sep = text(parent, "›") }
+                p = c.path
+                cb = btn(parent, c.label) callback { od_app.navigate_to(a, p) }
+            }
+            sv = splitview("h") {
+                lpane = vstack(4) {
+                    hstack(8) {
+                        a.name_btn = btn("Name") callback { od_app.toggle_sort(a, SORT_NAME) }
+                        spacer()
+                        a.size_btn = btn("Size ▼") callback { od_app.toggle_sort(a, SORT_SIZE) }
+                    }
+                    a.summary = text("")
+                    lsv = scrollview() {
+                        a.list = listbox(2) callback |item: ptr, i: int, row: int| {
+                            r = item as *Row
+                            nm = text(row, r.name)
+                            if r.is_dir == 1 { _nb = style_font_bold(nm) }
+                            loc = ""
+                            if a.searching == 1 { loc = od_tree.parent_path(r.path) }
+                            sub = row_subline(r, loc, a.home)
+                            if string.length(sub) > 0 {
+                                st = text(row, sub)
+                                _sc = style_text_color(st, 0.5, 0.5, 0.5)
+                            }
+                            spacer(row)
+                            if a.searching == 0 {
+                                long top = 1
+                                if list.size(a.rows) > 0 { top = od_view.row_at(a.rows, 0).size }
+                                if top < 1 { top = 1 }
+                                frac = (r.size as float) / (top as float)
+                                if frac > 0.0 {
+                                    bar = progressbar(row, frac)
+                                    _bw = width(bar, 46)
+                                }
+                            }
+                            szt = "--"
+                            if r.size_known == 1 { szt = od_fmt.file_size(r.size) }
+                            _sz = text(row, szt)
+                            chev = " "
+                            if r.is_dir == 1 { chev = "›" }
+                            _ch = text(row, chev)
+                            // drag a row out (into the Collector, or another app)
+                            if od_view.is_synthetic(r.path) == 0 { draggable(row, r.path) }
+                            rp = r.path
+                            rr = r
+                            context_menu_item(row, "Add to Collector") callback { od_app.collect_row(a, rr) }
+                            if od_view.is_synthetic(rp) == 0 {
+                                context_menu_item(row, "Open") callback { od_app.open_path(a, rp) }
+                                context_menu_item(row, "Show in File Manager") callback { od_app.reveal_path(a, rp) }
+                                context_menu_item(row, "Copy Path") callback { od_app.copy_path(a, rp) }
+                            }
+                        }
+                        on_select(a.list) callback |i: int| { od_app.row_clicked(a, i) }
+                    }
+                    _lf = fill_height(lsv)
+                }
+                rpane = vstack(6) {
+                    vg(view_box(0, 0, 500, 500), 460, 460) {
+                        anchor = rect(0, 0, 0, 0)
+                        root_node = vg.vg_root(vg.node_scene(anchor))
+                        scene = vg.node_scene(root_node)
+                        reg = canvas_region(root_node, 0.0, 0.0, 500.0, 500.0) callback |rn: ptr, t: float| {
+                            od_app.chart_paint(a, rn)
+                        }
+                        region_set_animated(reg, 0)
+                        cid = vg.scene_canvas(scene)
+                        a.cid = cid
+                        a.scene = scene
+                        a.cwid = aether_ui_canvas_get_widget(cid)
+                        _al = a11y_label(a.cwid, "Disk usage chart")
+                        canvas_on_move(cid) callback |px: float, py: float| {
+                            od_app.chart_move(a, vg.scene_px_to_vb_x(a.scene, px), vg.scene_px_to_vb_y(a.scene, py))
+                        }
+                        canvas_on_click(cid) callback |px: float, py: float| {
+                            od_app.chart_click(a, vg.scene_px_to_vb_x(a.scene, px), vg.scene_px_to_vb_y(a.scene, py))
+                        }
+                        context_menu_item(a.cwid, "Add to Collector") callback { od_app.collect_hovered(a) }
+                        context_menu_item(a.cwid, "Show in File Manager") callback {
+                            if a.hovered != null { od_app.reveal_path(a, a.hovered.path) }
+                        }
+                        context_menu_item(a.cwid, "Copy Path") callback {
+                            if a.hovered != null { od_app.copy_path(a, a.hovered.path) }
+                        }
+                    }
+                    // The Collector
+                    col = vstack(4) {
+                        a.col_notice = text("")
+                        _nc = style_text_color(a.col_notice, 0.85, 0.45, 0.0)
+                        hstack(8) {
+                            vstack(2) {
+                                a.col_title = text("Drag files here to collect them for deletion")
+                                _ct = style_font_bold(a.col_title)
+                                a.col_sub = text("")
+                            }
+                            spacer()
+                            a.col_delete = btn("Delete") callback { od_app.ask_delete(a) }
+                        }
+                        a.col_progress = progressbar(0.0)
+                        a.col_items = each("v", 2) callback |item: ptr, i: int, parent: int| {
+                            it = item as *Item
+                            row = hstack(parent, 6)
+                            p = it.path
+                            _x = btn(row, "×") callback { od_app.uncollect(a, p) }
+                            _n = text(row, it.name)
+                            spacer(row)
+                            _s = text(row, od_fmt.file_size(it.size))
+                        }
+                    }
+                }
+            }
+            _sf = fill_height(sv)
+            // Status bar
+            hstack(8) {
+                a.progress = progressbar(0.0)
+                _pw = width(a.progress, 120)
+                a.status = text("")
+                spacer()
+                a.capacity = text("")
+                a.total_lbl = text("")
+                _tlb = style_font_bold(a.total_lbl)
+            }
+        }
+      }
+
+      // Keys: Ctrl+R rescans (Cmd+R on macOS), Ctrl+Z undoes the last
+      // Collector change.
+      shortcut("Ctrl+R") callback { od_app.rescan(a) }
+      shortcut("Ctrl+Z") callback { od_app.undo_collect(a) }
+
+      // Dropping files anywhere on the window collects them.
+      on_file_drop(|paths: ptr, n: int| {
+          got = strarr.new()
+          i = 0
+          while i < n {
+              _ = strarr.push_copy(got, string.string_array_get(paths, i))
+              i = i + 1
+          }
+          od_app.collect_paths(a, got)
+      })
+
+      _h = set_hidden(a.analysis, 1)
+      od_app.refresh_devices(a)
+      od_app.refresh(a)
+      if string.length(start) > 0 {
+          od_app.start_analysis(a, start, od_tree.last_component(start), 0)
+      }
+      _hb = timer(33) callback { od_app.tick(a) }
+      if os_getenv("AETHER_UI_TEST_PORT") != null { enable_test_server(9222) }
+    }
+}
+
+od_recent_remove(a: *App, p: string) {
+    od_recent.recent_remove(p)
+    od_app.refresh_devices(a)
+}

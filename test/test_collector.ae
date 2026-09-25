@@ -1,0 +1,181 @@
+// OpenDisk Collector (port of CollectorTests), on real temporary files.
+import std.spec
+import std.list
+import std.strarr
+import std.string
+import std.fs
+import std.os
+import od_collector
+import od_collector (Collector, Item, collector_new, add, add_batch, remove, clear,
+    undo, can_undo, count, total_bytes, contains, item_at, set_rules, notice,
+    delete_all, del_deleted, del_failures, deleting, item_new)
+
+// A fresh folder under the temp dir, with the Collector's protection rules
+// pinned so the temp folder itself is never "protected" by the host's list.
+fresh_dir(tag: string) -> string {
+    p, err = fs.make_temp_dir(os.temp_dir(), string.concat("odcol-", tag))
+    return p
+}
+
+mk(dir: string, name: string, content: string) -> string {
+    p = string.concat(dir, string.concat("/", name))
+    _w = fs.write(p, content)
+    return p
+}
+
+collector() -> *Collector {
+    c = collector_new()
+    set_rules(c, "linux", "/home/nobody-opendisk-tests")
+    return c
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "adding") {
+        spec.it("a folder absorbs an item already collected inside it") callback {
+            d = fresh_dir("absorb")
+            sub = string.concat(d, "/sub")
+            _m = fs.create_dir(sub)
+            f = mk(sub, "a.bin", "x")
+            c = collector()
+            spec.assert_eq(add(c, item_new(f, 4, 0)), 1, "child added")
+            spec.assert_eq(add(c, item_new(sub, 10, 1)), 1, "parent added")
+            spec.assert_eq(count(c), 1, "one item")
+            spec.assert_str_eq(item_at(c, 0).path, sub, "it is the folder")
+            spec.assert_eq_long(total_bytes(c), 10, "folder's size")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("an item inside a collected folder is ignored; one undo empties") callback {
+            d = fresh_dir("inside")
+            sub = string.concat(d, "/sub")
+            _m = fs.create_dir(sub)
+            f = mk(sub, "a.bin", "x")
+            c = collector()
+            _a = add(c, item_new(sub, 10, 1))
+            spec.assert_eq(add(c, item_new(f, 4, 0)), 0, "child ignored")
+            spec.assert_eq(count(c), 1, "still one")
+            spec.assert_eq(undo(c), 1, "undo")
+            spec.assert_eq(count(c), 0, "empty")
+            spec.assert_false(can_undo(c), "nothing left to undo")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("a duplicate is one item and one undo step") callback {
+            d = fresh_dir("dup")
+            f = mk(d, "a.bin", "x")
+            c = collector()
+            _a = add(c, item_new(f, 4, 0))
+            _b = add(c, item_new(f, 4, 0))
+            spec.assert_eq(count(c), 1, "one")
+            _u = undo(c)
+            spec.assert_eq(count(c), 0, "one undo empties")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("refuses a protected path with a notice and no undo step") callback {
+            c = collector_new()
+            set_rules(c, "macos", "/Users/alice")
+            spec.assert_eq(add(c, item_new("/System", 1, 1)), 0, "refused")
+            spec.assert_contains(notice(c), "System", "notice names it")
+            spec.assert_contains(notice(c), "can't be deleted", "and says why")
+            spec.assert_false(can_undo(c), "no undo step")
+        }
+        spec.it("refuses synthetic and missing paths silently") callback {
+            c = collector()
+            spec.assert_eq(add(c, item_new("::Purgeable Space", 1, 1)), 0, "synthetic")
+            spec.assert_eq(add(c, item_new("/nope/not/here/at/all", 1, 0)), 0, "missing")
+            spec.assert_str_eq(notice(c), "", "no notice")
+            spec.assert_false(can_undo(c), "no undo")
+        }
+        spec.it("contains is an exact match") callback {
+            d = fresh_dir("exact")
+            f = mk(d, "a.bin", "x")
+            c = collector()
+            _a = add(c, item_new(f, 4, 0))
+            spec.assert_true(contains(c, f), "the file")
+            spec.assert_false(contains(c, d), "not its folder")
+            _r = fs.remove_tree(d)
+        }
+    }
+
+    spec.describe(fw, "totals and undo") {
+        spec.it("totals follow adds, removes and clear") callback {
+            d = fresh_dir("totals")
+            a = mk(d, "a", "x")
+            b = mk(d, "b", "x")
+            c = collector()
+            batch = list.new()
+            _ = list.add(batch, item_new(a, 4, 0) as ptr)
+            _ = list.add(batch, item_new(b, 8, 0) as ptr)
+            spec.assert_eq(add_batch(c, batch), 2, "both")
+            spec.assert_eq_long(total_bytes(c), 12, "12")
+            _x = remove(c, a)
+            spec.assert_eq_long(total_bytes(c), 8, "8")
+            clear(c)
+            spec.assert_eq_long(total_bytes(c), 0, "0")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("undo steps back one change at a time; a batch is one step") callback {
+            d = fresh_dir("undo")
+            a = mk(d, "a", "x")
+            b = mk(d, "b", "x")
+            c = collector()
+            batch = list.new()
+            _ = list.add(batch, item_new(a, 4, 0) as ptr)
+            _ = list.add(batch, item_new(b, 8, 0) as ptr)
+            _ab = add_batch(c, batch)
+            _x = remove(c, a)
+            clear(c)
+            _u1 = undo(c)
+            spec.assert_eq(count(c), 1, "clear undone")
+            _u2 = undo(c)
+            spec.assert_eq(count(c), 2, "remove undone")
+            _u3 = undo(c)
+            spec.assert_eq(count(c), 0, "the batch was one step")
+            spec.assert_eq(undo(c), 0, "undo on empty is a no-op")
+            _r = fs.remove_tree(d)
+        }
+    }
+
+    spec.describe(fw, "deleting") {
+        spec.it("deletes files and folders permanently and empties the Collector") callback {
+            d = fresh_dir("del")
+            f = mk(d, "file", "four")
+            sub = string.concat(d, "/folder")
+            _m = fs.create_dir(sub)
+            _i = mk(sub, "inner", "eight!!!")
+            c = collector()
+            _a = add(c, item_new(f, 4, 0))
+            _b = add(c, item_new(sub, 8, 1))
+            freed = delete_all(c)
+            spec.assert_eq(del_deleted(c), 2, "deleted 2")
+            spec.assert_eq(strarr.size(del_failures(c)), 0, "no failures")
+            spec.assert_eq_long(freed, 12, "freed 12")
+            spec.assert_false(fs.exists(f), "file gone")
+            spec.assert_false(fs.exists(sub), "folder gone")
+            spec.assert_eq(count(c), 0, "empty")
+            spec.assert_false(deleting(c), "finished")
+            spec.assert_false(can_undo(c), "no undo after deleting")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("keeps what could not be deleted") callback {
+            d = fresh_dir("delfail")
+            ok = mk(d, "ok", "four")
+            gone = mk(d, "gone", "x")
+            c = collector()
+            _a = add(c, item_new(ok, 4, 0))
+            _b = add(c, item_new(gone, 8, 0))
+            // Removed behind the Collector's back: deleting it now fails.
+            _x = fs.delete(gone)
+            freed = delete_all(c)
+            spec.assert_eq(del_deleted(c), 1, "one deleted")
+            fails = del_failures(c)
+            spec.assert_eq(strarr.size(fails), 1, "one failure")
+            spec.assert_str_eq(strarr.get(fails, 0), gone, "the vanished one")
+            spec.assert_eq_long(freed, 4, "only the real bytes")
+            spec.assert_eq(count(c), 1, "the failure stays collected")
+            spec.assert_str_eq(item_at(c, 0).path, gone, "it is the failure")
+            _r = fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}

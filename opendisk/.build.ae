@@ -1,0 +1,30 @@
+// OpenDisk's build node: `aeb opendisk/.build.ae` from the repo root.
+//
+// Aether UI comes from the sibling checkout the `aether-ui` symlink at the
+// repo root points to (../aether-ui by default; re-point it to use another).
+// Its `ui` and `vg` modules go on the module path, and ui_backend links the
+// native backend for this OS from that checkout — so the per-OS link setup
+// is aether-ui's own, never a copy here that could drift from it.
+import bldr
+import aether
+import aether (source, output, no_closure_regen, lib, extra_source)
+import build_support.aetherui (ui_backend)
+
+main() {
+    bldr.build() {
+        root = _get("root")
+        ui = "${root}/aether-ui"
+        aether.program() {
+            source("opendisk.ae")
+            output("opendisk")
+            lib(ui)
+            // The C the od_stat / od_text modules ship via @source: `ae run`
+            // compiles it in on its own, aeb's link needs it named.
+            extra_source("od_stat.c")
+            extra_source("od_text.c")
+            no_closure_regen()
+            ui_backend(ui)
+        }
+        return 0
+    }
+}

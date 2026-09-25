@@ -1,0 +1,261 @@
+// od_draw.ae — paint an od_chart into a vg region: sectors, their labels
+// along the ring, the centre label, and the hover highlight + tip.
+//
+// Port of OpenDisk's RingsChartView drawing (MIT, © 137137137):
+//   - every sector is outlined in black at 35%: drawn here as the fill
+//     darkened by 35%, which is exactly that stroke over that fill
+//   - a folder with more rings below MAX_DEPTH gets a "continued" arc just
+//     outside it, in its own colour
+//   - a name follows the middle of its ring, glyph by glyph, only when it
+//     fits whole (thickness ≥ 12, arc ≥ 30, text ≤ 85% of the arc, line
+//     height ≤ 85% of the ring); in the lower half it runs the other way so
+//     it stays upright
+//   - the centre shows the name over the size (just the size when the name
+//     is too wide)
+//   - hover: the segment is redrawn highlighted, and a dark tip shows
+//     "name" over "size · pct%" beside the pointer
+
+exports (draw_chart, hex_rgb)
+
+import std.math
+import std.string
+import std.list
+import vg
+import vg.geom.polypath
+import od_chart
+import od_chart (Chart, Seg, seg_at, seg_count, palette_rgb, color_position, TWO_PI)
+import od_fmt
+import od_view
+
+const LABEL_SIZE: float = 11.0
+const CENTER_NAME_SIZE: float = 13.0
+const CENTER_SIZE_SIZE: float = 11.0
+const TIP_SIZE: float = 12.0
+const ARC_STEP: float = 0.04
+
+extern cos(x: float) -> float
+extern sin(x: float) -> float
+
+hex2(v: float) -> string {
+    i = math.round(v * 255.0) as int
+    if i < 0 { i = 0 }
+    if i > 255 { i = 255 }
+    digits = "0123456789abcdef"
+    hi = i / 16
+    lo = i - hi * 16
+    return string.concat(string.substring(digits, hi, hi + 1), string.substring(digits, lo, lo + 1))
+}
+
+hex_rgb(r: float, g: float, b: float) -> string {
+    return string.concat("#", string.concat(hex2(r), string.concat(hex2(g), hex2(b))))
+}
+
+fnum(v: float) -> string {
+    // two decimals are plenty for a path in viewBox units
+    long c = math.round(v * 100.0) as long
+    neg = ""
+    if c < 0 {
+        neg = "-"
+        c = 0 - c
+    }
+    long w = c / 100
+    long f = c - w * 100
+    pad = ""
+    if f < 10 { pad = "0" }
+    return "${neg}${w}.${pad}${f}"
+}
+
+pt(x: float, y: float) -> string { return string.concat(fnum(x), string.concat(" ", fnum(y))) }
+
+// A ring sector (or the full disc when inner is 0 and the sweep is 2π) as
+// a closed polygon: along the outer edge, back along the inner one.
+sector_d(cx: float, cy: float, r0: float, r1: float, a0: float, sweep: float) -> string {
+    steps = (sweep / ARC_STEP) as int + 1
+    if steps < 2 { steps = 2 }
+    d = ""
+    i = 0
+    while i <= steps {
+        a = a0 + sweep * (i as float) / (steps as float)
+        p = pt(cx + r1 * cos(a), cy + r1 * sin(a))
+        if i == 0 { d = string.concat("M ", p) }
+        else { d = string.concat(d, string.concat(" L ", p)) }
+        i = i + 1
+    }
+    if r0 > 0.0 {
+        j = steps
+        while j >= 0 {
+            a = a0 + sweep * (j as float) / (steps as float)
+            d = string.concat(d, string.concat(" L ", pt(cx + r0 * cos(a), cy + r0 * sin(a))))
+            j = j - 1
+        }
+    }
+    return string.concat(d, " Z")
+}
+
+// An open arc (the "continued" edge), as a thin closed band.
+band_d(cx: float, cy: float, r: float, width: float, a0: float, sweep: float) -> string {
+    return sector_d(cx, cy, r - width / 2.0, r + width / 2.0, a0, sweep)
+}
+
+fill_of(s: *Seg, hi: int) -> string {
+    pos = color_position(s)
+    return hex_rgb(palette_rgb(pos, s.depth, hi, 0), palette_rgb(pos, s.depth, hi, 1),
+                   palette_rgb(pos, s.depth, hi, 2))
+}
+
+// The fill darkened as if black at 35% were drawn over it.
+edge_of(s: *Seg, hi: int) -> string {
+    pos = color_position(s)
+    k = 0.65
+    return hex_rgb(palette_rgb(pos, s.depth, hi, 0) * k, palette_rgb(pos, s.depth, hi, 1) * k,
+                   palette_rgb(pos, s.depth, hi, 2) * k)
+}
+
+draw_seg(rn: ptr, c: *Chart, s: *Seg, hi: int) {
+    if s.depth > 0 { if s.sweep <= 0.0 { return } }
+    d = sector_d(c.cx, c.cy, s.inner, s.outer, s.start, s.sweep)
+    p = vg.path(rn, d)
+    vg.fill(p, fill_of(s, hi))
+    vg.stroke(p, edge_of(s, hi), 1.0)
+    if s.hidden_children == 1 {
+        e = vg.path(rn, band_d(c.cx, c.cy, s.outer + 4.0, 3.0, s.start, s.sweep))
+        vg.fill(e, fill_of(s, hi))
+    }
+}
+
+// Next UTF-8 character of `s` starting at byte `i`: its byte length.
+char_len(s: string, i: int) -> int {
+    b = string.string_char_at(s, i)
+    if b < 0 { b = b + 256 }        // Apple clang sign-extends char returns
+    if b < 128 { return 1 }
+    if b >= 240 { return 4 }
+    if b >= 224 { return 3 }
+    return 2
+}
+
+// One glyph, centred on (px, py), rotated by `rot` radians.
+glyph(rn: ptr, ch: string, px: float, py: float, rot: float, color: string) {
+    gw = vg.text_paths_width(ch, LABEL_SIZE)
+    pp = vg.text_polypath(ch, 0.0 - gw / 2.0, LABEL_SIZE * 0.35, LABEL_SIZE)
+    n = polypath.pp_npts(pp)
+    if n == 0 {
+        polypath.pp_free(pp)
+        return
+    }
+    cr = cos(rot)
+    sr = sin(rot)
+    i = 0
+    while i < n {
+        x = polypath.pp_x(pp, i)
+        y = polypath.pp_y(pp, i)
+        polypath.pp_set(pp, i, px + x * cr - y * sr, py + x * sr + y * cr)
+        i = i + 1
+    }
+    g = vg.path(rn, polypath.pp_to_path(pp))
+    vg.fill(g, color)
+    polypath.pp_free(pp)
+}
+
+draw_label(rn: ptr, c: *Chart, s: *Seg) {
+    if s.depth == 0 { return }
+    if s.sweep <= 0.0 { return }
+    th = s.outer - s.inner
+    if th < 12.0 { return }
+    mid_r = (s.inner + s.outer) / 2.0
+    arc = s.sweep * mid_r
+    if arc < 30.0 { return }
+    if LABEL_SIZE * 1.2 > th * 0.85 { return }
+    tw = vg.text_paths_width(s.name, LABEL_SIZE)
+    if tw <= 0.0 { return }                 // no outline font available
+    if tw > arc * 0.85 { return }
+    bis = s.start + s.sweep / 2.0
+    lower = 0
+    if sin(bis) > 0.0 { lower = 1 }
+    half = tw / 2.0 / mid_r
+    acc = 0.0
+    i = 0
+    n = string.length(s.name)
+    while i < n {
+        cl = char_len(s.name, i)
+        ch = string.substring(s.name, i, i + cl)
+        gw = vg.text_paths_width(ch, LABEL_SIZE)
+        off = (acc + gw / 2.0) / mid_r
+        a = bis - half + off
+        rot = a + 1.5707963267948966
+        if lower == 1 {
+            a = bis + half - off
+            rot = a - 1.5707963267948966
+        }
+        glyph(rn, ch, c.cx + mid_r * cos(a), c.cy + mid_r * sin(a), rot, "#404040")
+        acc = acc + gw
+        i = i + cl
+    }
+}
+
+draw_center(rn: ptr, c: *Chart) {
+    root = seg_at(c, 0)
+    size_txt = od_fmt.file_size(c.size)
+    name_w = vg.text_width(CENTER_NAME_SIZE, c.name)
+    if name_w > 1.7 * root.outer {
+        t = vg.text_anchored(rn, c.cx, c.cy + vg.font_ascent(CENTER_SIZE_SIZE) / 2.0,
+                             CENTER_SIZE_SIZE, "middle", size_txt)
+        vg.fill(t, "#666666")
+        return
+    }
+    t1 = vg.text_anchored(rn, c.cx, c.cy - 2.0, CENTER_NAME_SIZE, "middle", c.name)
+    vg.fill(t1, "#404040")
+    t2 = vg.text_anchored(rn, c.cx, c.cy + vg.font_ascent(CENTER_SIZE_SIZE) + 2.0,
+                          CENTER_SIZE_SIZE, "middle", size_txt)
+    vg.fill(t2, "#666666")
+}
+
+draw_tip(rn: ptr, c: *Chart, s: *Seg, mx: float, my: float) {
+    title = s.name
+    detail = od_view.tip_detail(s.size, s.fraction)
+    tw = math.max_float(vg.text_width(TIP_SIZE, title), vg.text_width(TIP_SIZE - 1.0, detail))
+    maxw = math.min_float(280.0, c.w - 16.0)
+    if tw > maxw { tw = maxw }
+    w = tw + 16.0
+    h = TIP_SIZE * 2.0 + 14.0
+    x = mx + 14.0
+    y = my - 28.0 - h / 2.0
+    if x + w > c.w - 4.0 { x = mx - 14.0 - w }
+    if x < 4.0 { x = 4.0 }
+    if x > c.w - w - 4.0 { x = c.w - w - 4.0 }
+    if y < 4.0 { y = 4.0 }
+    if y > c.h - h - 4.0 { y = c.h - h - 4.0 }
+    bg = vg.rrect(rn, x, y, w, h, 6.0)
+    vg.fill(bg, "#333333")
+    t1 = vg.text_sized(rn, x + 8.0, y + 5.0 + vg.font_ascent(TIP_SIZE), TIP_SIZE, title)
+    vg.fill(t1, "#ffffff")
+    t2 = vg.text_sized(rn, x + 8.0, y + 7.0 + TIP_SIZE + vg.font_ascent(TIP_SIZE - 1.0),
+                       TIP_SIZE - 1.0, detail)
+    vg.fill(t2, "#d9d9d9")
+}
+
+// The whole chart in a w×h area (just the background when `c` is null).
+// `hovered` (may be null) is drawn highlighted, with its tip at the pointer
+// (mx, my), all in viewBox units.
+draw_chart(rn: ptr, c: *Chart, hovered: *Seg, mx: float, my: float, w: float, h: float) {
+    bg = vg.rect(rn, 0.0, 0.0, w, h)
+    vg.fill(bg, "#ffffff")
+    if c == null { return }
+    n = seg_count(c)
+    i = 0
+    while i < n {
+        s = seg_at(c, i)
+        hi = 0
+        if s == hovered { hi = 1 }
+        draw_seg(rn, c, s, hi)
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        draw_label(rn, c, seg_at(c, i))
+        i = i + 1
+    }
+    draw_center(rn, c)
+    if hovered != null {
+        if hovered.depth > 0 { draw_tip(rn, c, hovered, mx, my) }
+    }
+}

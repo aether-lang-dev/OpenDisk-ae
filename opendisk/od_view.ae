@@ -1,0 +1,392 @@
+// od_view.ae — what the analysis screen shows, as data and text. Pure: the
+// window code in opendisk.ae only puts these on screen, so the rules are
+// testable without one.
+//
+// Port of OpenDisk's DiskAnalyzer view rules and view strings (MIT,
+// © 137137137):
+//   - at the scan root every child is a candidate; deeper, only the first
+//     MAX_VISIBLE_CHILDREN largest. Of the candidates only items over
+//     MIN_VISIBLE_SIZE bytes are listed (while a scan runs, all of them)
+//   - items already in the Collector are not listed
+//   - "Purgeable Space": a synthetic row at the scan root adding up the
+//     known cache folders found in the tree (per-OS catalogue below)
+//   - list order: Size descending by default; Name ascending when chosen
+
+exports (
+    Row, row_of, rows_for, purgeable_row, caches_found, cache_rows, sort_rows,
+    PURGEABLE_PATH, PURGEABLE_NAME, MAX_VISIBLE_CHILDREN, MIN_VISIBLE_SIZE,
+    row_subline, status_scanning, status_idle_total, capacity_text, search_summary,
+    crumbs, Crumb, tip_detail, cache_catalogue_count, cache_catalogue_name,
+    cache_catalogue_path, SORT_SIZE, SORT_NAME, row_at, is_synthetic
+)
+
+import std.string
+import std.list
+import od_tree
+import od_tree (Node, child_at, sorted_for_display, node_for_path, last_component)
+import od_fmt
+import od_collector
+import od_collector (Collector)
+import od_protected
+
+extern malloc(size: int) -> ptr
+
+const MAX_VISIBLE_CHILDREN: int = 100
+const MIN_VISIBLE_SIZE: long = 1024
+const PURGEABLE_PATH: string = "::Purgeable Space"
+const PURGEABLE_NAME: string = "Purgeable Space"
+const SORT_SIZE: int = 0
+const SORT_NAME: int = 1
+
+struct Row {
+    name: string,
+    path: string,
+    size: long,
+    is_dir: int,
+    item_count: int,
+    size_known: int,
+    node: *Node        // null for synthetic rows
+}
+
+row_of(n: *Node) -> *Row {
+    r = malloc(sizeof(Row)) as *Row
+    r.name = n.name
+    r.path = n.path
+    r.size = n.size
+    r.is_dir = n.is_dir
+    r.item_count = 0
+    if n.is_dir == 1 { r.item_count = list.size(n.children) }
+    r.size_known = 1
+    r.node = n
+    return r
+}
+
+row_at(l: ptr, i: int) -> *Row { return list.list_get_raw(l, i) as *Row }
+
+is_synthetic(path: string) -> int { return string.starts_with(path, "::") }
+
+// ─── The cache catalogue ("Purgeable Space") ───────────────────────
+
+// Entries are "Name|path" with ~ for the home folder; which list applies
+// depends on the OS. OpenDisk's own (macOS) list first.
+cache_entry(os: string, i: int) -> string {
+    if string.equals(os, "macos") == 1 {
+        if i == 0 { return "Homebrew Cache|~/Library/Caches/Homebrew" }
+        if i == 1 { return "npm Cache|~/.npm/_cacache" }
+        if i == 2 { return "Yarn Cache|~/Library/Caches/Yarn" }
+        if i == 3 { return "pnpm Store|~/Library/pnpm/store" }
+        if i == 4 { return "pip Cache|~/Library/Caches/pip" }
+        if i == 5 { return "Cargo Registry Cache|~/.cargo/registry/cache" }
+        if i == 6 { return "Go Build Cache|~/Library/Caches/go-build" }
+        if i == 7 { return "Go Module Cache|~/go/pkg/mod/cache" }
+        if i == 8 { return "Gradle Cache|~/.gradle/caches" }
+        if i == 9 { return "CocoaPods Cache|~/Library/Caches/CocoaPods" }
+        if i == 10 { return "Composer Cache|~/.composer/cache" }
+        if i == 11 { return "Xcode DerivedData|~/Library/Developer/Xcode/DerivedData" }
+        if i == 12 { return "Xcode iOS DeviceSupport|~/Library/Developer/Xcode/iOS DeviceSupport" }
+        if i == 13 { return "Xcode Archives|~/Library/Developer/Xcode/Archives" }
+        if i == 14 { return "Playwright Browsers|~/.cache/ms-playwright" }
+        if i == 15 { return "Puppeteer Browsers|~/.cache/puppeteer" }
+        if i == 16 { return "Chrome Cache|~/Library/Caches/Google/Chrome" }
+        if i == 17 { return "Safari Cache|~/Library/Caches/com.apple.Safari" }
+        if i == 18 { return "Hugging Face Cache|~/.cache/huggingface" }
+        if i == 19 { return "PyTorch Hub Cache|~/.cache/torch" }
+        if i == 20 { return "User Logs|~/Library/Logs" }
+        if i == 21 { return "Trash|~/.Trash" }
+        if i == 22 { return "System Caches|/Library/Caches" }
+        return ""
+    }
+    if string.equals(os, "windows") == 1 {
+        if i == 0 { return "npm Cache|~/AppData/Local/npm-cache" }
+        if i == 1 { return "Yarn Cache|~/AppData/Local/Yarn/Cache" }
+        if i == 2 { return "pnpm Store|~/AppData/Local/pnpm/store" }
+        if i == 3 { return "pip Cache|~/AppData/Local/pip/cache" }
+        if i == 4 { return "Cargo Registry Cache|~/.cargo/registry/cache" }
+        if i == 5 { return "Go Build Cache|~/AppData/Local/go-build" }
+        if i == 6 { return "Go Module Cache|~/go/pkg/mod/cache" }
+        if i == 7 { return "Gradle Cache|~/.gradle/caches" }
+        if i == 8 { return "Composer Cache|~/AppData/Local/Composer" }
+        if i == 9 { return "Playwright Browsers|~/AppData/Local/ms-playwright" }
+        if i == 10 { return "Chrome Cache|~/AppData/Local/Google/Chrome/User Data/Default/Cache" }
+        if i == 11 { return "Hugging Face Cache|~/.cache/huggingface" }
+        if i == 12 { return "PyTorch Hub Cache|~/.cache/torch" }
+        if i == 13 { return "Temporary Files|~/AppData/Local/Temp" }
+        return ""
+    }
+    // Linux / BSD (XDG locations)
+    if i == 0 { return "Homebrew Cache|~/.cache/Homebrew" }
+    if i == 1 { return "npm Cache|~/.npm/_cacache" }
+    if i == 2 { return "Yarn Cache|~/.cache/yarn" }
+    if i == 3 { return "pnpm Store|~/.local/share/pnpm/store" }
+    if i == 4 { return "pip Cache|~/.cache/pip" }
+    if i == 5 { return "Cargo Registry Cache|~/.cargo/registry/cache" }
+    if i == 6 { return "Go Build Cache|~/.cache/go-build" }
+    if i == 7 { return "Go Module Cache|~/go/pkg/mod/cache" }
+    if i == 8 { return "Gradle Cache|~/.gradle/caches" }
+    if i == 9 { return "Composer Cache|~/.cache/composer" }
+    if i == 10 { return "Playwright Browsers|~/.cache/ms-playwright" }
+    if i == 11 { return "Puppeteer Browsers|~/.cache/puppeteer" }
+    if i == 12 { return "Chrome Cache|~/.cache/google-chrome" }
+    if i == 13 { return "Hugging Face Cache|~/.cache/huggingface" }
+    if i == 14 { return "PyTorch Hub Cache|~/.cache/torch" }
+    if i == 15 { return "Thumbnails|~/.cache/thumbnails" }
+    if i == 16 { return "Trash|~/.local/share/Trash" }
+    return ""
+}
+
+cache_catalogue_count(os: string) -> int {
+    n = 0
+    while string.length(cache_entry(os, n)) > 0 { n = n + 1 }
+    return n
+}
+
+cache_catalogue_name(os: string, i: int) -> string {
+    e = cache_entry(os, i)
+    return string.substring(e, 0, string.index_of(e, "|"))
+}
+
+cache_catalogue_path(os: string, i: int, home: string) -> string {
+    e = cache_entry(os, i)
+    p = string.substring(e, string.index_of(e, "|") + 1, string.length(e))
+    if string.starts_with(p, "~/") == 1 {
+        p = string.concat(home, string.substring(p, 1, string.length(p)))
+    }
+    return p
+}
+
+// The cache folders present in the scanned tree (directory, size > 0), as
+// rows named by the catalogue, largest first.
+cache_rows(root: *Node, os: string, home: string) -> ptr {
+    out = list.new()
+    n = cache_catalogue_count(os)
+    i = 0
+    while i < n {
+        p = cache_catalogue_path(os, i, home)
+        node = node_for_path(root, p)
+        if node != null {
+            if node.is_dir == 1 {
+                if node.size > 0 {
+                    r = row_of(node)
+                    r.name = cache_catalogue_name(os, i)
+                    r.item_count = 0
+                    _ = list.add(out, r as ptr)
+                }
+            }
+        }
+        i = i + 1
+    }
+    sort_rows(out, SORT_SIZE, 0)
+    return out
+}
+
+caches_found(root: *Node, os: string, home: string) -> int {
+    return list.size(cache_rows(root, os, home))
+}
+
+// The "Purgeable Space" row, or null when no cache folder was found.
+purgeable_row(root: *Node, os: string, home: string) -> *Row {
+    caches = cache_rows(root, os, home)
+    n = list.size(caches)
+    if n == 0 { return null as *Row }
+    r = malloc(sizeof(Row)) as *Row
+    r.name = PURGEABLE_NAME
+    r.path = PURGEABLE_PATH
+    long total = 0
+    i = 0
+    while i < n {
+        total = total + row_at(caches, i).size
+        i = i + 1
+    }
+    r.size = total
+    r.is_dir = 1
+    r.item_count = n
+    r.size_known = 1
+    r.node = null as *Node
+    return r
+}
+
+// ─── The list ─────────────────────────────────────────────────────
+
+// Rows for folder `n`. `at_root` = it is the scan root (no count cap, and
+// the Purgeable row when caches exist); `partial` = the scan is still
+// running (nothing is hidden for being small). Collected paths are left out.
+rows_for(n: *Node, at_root: int, partial: int, col: *Collector, os: string, home: string) -> ptr {
+    out = list.new()
+    if n == null { return out }
+    kids = sorted_for_display(n)
+    k = list.size(kids)
+    limit = k
+    if at_root == 0 {
+        if limit > MAX_VISIBLE_CHILDREN { limit = MAX_VISIBLE_CHILDREN }
+    }
+    i = 0
+    while i < limit {
+        c = list.list_get_raw(kids, i) as *Node
+        keep = 1
+        if partial == 0 { if c.size <= MIN_VISIBLE_SIZE { keep = 0 } }
+        if col != null { if od_collector.contains(col, c.path) == 1 { keep = 0 } }
+        if keep == 1 { _ = list.add(out, row_of(c) as ptr) }
+        i = i + 1
+    }
+    if at_root == 1 {
+        pr = purgeable_row(n, os, home)
+        if pr != null {
+            // hidden once every cache it stands for is collected
+            all_in = 0
+            if col != null {
+                caches = cache_rows(n, os, home)
+                all_in = 1
+                j = 0
+                while j < list.size(caches) {
+                    if od_collector.contains(col, row_at(caches, j).path) == 0 { all_in = 0 }
+                    j = j + 1
+                }
+            }
+            if all_in == 0 { _ = list.add(out, pr as ptr) }
+        }
+    }
+    return out
+}
+
+cmp_rows(mode: int, desc: int, a: *Row, b: *Row) -> int {
+    c = 0
+    if mode == SORT_NAME {
+        c = string.compare(string.to_lower(a.name), string.to_lower(b.name))
+        if c == 0 { c = string.compare(a.name, b.name) }
+    } else {
+        if a.size < b.size { c = -1 }
+        if a.size > b.size { c = 1 }
+        if c == 0 { c = 0 - string.compare(a.name, b.name) }
+    }
+    if desc == 1 { return 0 - c }
+    return c
+}
+
+// Stable insertion sort (a folder's visible rows are at most a few
+// hundred; the root can be more, still fine at human speeds).
+sort_rows(l: ptr, mode: int, ascending: int) {
+    desc = 1
+    if ascending == 1 { desc = 0 }
+    n = list.size(l)
+    i = 1
+    while i < n {
+        cur = list.list_get_raw(l, i)
+        j = i - 1
+        while j >= 0 {
+            if cmp_rows(mode, desc, row_at(l, j), cur as *Row) <= 0 { break }
+            list.list_set(l, j + 1, list.list_get_raw(l, j))
+            j = j - 1
+        }
+        list.list_set(l, j + 1, cur)
+        i = i + 1
+    }
+}
+
+// "12 items" under a folder name (no singular — OpenDisk's own), or the
+// location for a search result ("~/Documents").
+row_subline(r: *Row, location: string, home: string) -> string {
+    if string.length(location) > 0 {
+        loc = location
+        if string.length(home) > 0 {
+            if string.equals(loc, home) == 1 { loc = "~" }
+            else if string.starts_with(loc, string.concat(home, "/")) == 1 {
+                loc = string.concat("~", string.substring(loc, string.length(home), string.length(loc)))
+            }
+        }
+        return loc
+    }
+    if r.is_dir == 1 {
+        if r.item_count > 0 { return "${r.item_count} items" }
+    }
+    return ""
+}
+
+// ─── Status and summaries ─────────────────────────────────────────
+
+// "Scanning: 1.2 GB (3,456 items) · 1,234 files/sec"
+status_scanning(bytes: long, items: int, elapsed: float) -> string {
+    if items == 0 { return "Scanning…" }
+    s = "Scanning: ${od_fmt.file_size(bytes)} (${od_fmt.grouped(items as long)} items)"
+    if elapsed > 0.0 {
+        long rate = ((items as float) / elapsed) as long
+        s = string.concat(s, " · ${od_fmt.grouped(rate)} files/sec")
+    }
+    return s
+}
+
+// "4.2 GB · 12 items"
+status_idle_total(bytes: long, rows: int) -> string {
+    return string.concat(od_fmt.file_size(bytes), string.concat(" · ", od_fmt.plural_items(rows as long)))
+}
+
+// "120 GB available of 500 GB"
+capacity_text(available: long, total: long) -> string {
+    return string.concat(od_fmt.file_size(available),
+        string.concat(" available of ", od_fmt.file_size(total)))
+}
+
+// "Largest 500 of 1,234 matches" / "1 match · largest first" /
+// "12 matches · largest first", plus the partial-scan note.
+search_summary(shown: int, total: int, partial: int) -> string {
+    s = ""
+    if total > shown {
+        s = "Largest ${od_fmt.grouped(shown as long)} of ${od_fmt.grouped(total as long)} matches"
+    } else if total == 1 {
+        s = "1 match · largest first"
+    } else {
+        s = "${od_fmt.grouped(total as long)} matches · largest first"
+    }
+    if partial == 1 { s = string.concat(s, " · scan in progress, results may be incomplete") }
+    return s
+}
+
+// Hover tip detail: "1.2 GB · 40.0%"
+tip_detail(size: long, fraction: float) -> string {
+    return string.concat(od_fmt.file_size(size), string.concat(" · ", string.concat(od_fmt.pct1(fraction), "%")))
+}
+
+// ─── Breadcrumbs ──────────────────────────────────────────────────
+
+struct Crumb {
+    label: string,
+    path: string
+}
+
+mk_crumb(label: string, path: string) -> *Crumb {
+    c = malloc(sizeof(Crumb)) as *Crumb
+    c.label = label
+    c.path = path
+    return c
+}
+
+// The root first (as `root_name`), then one crumb per folder down to
+// `current`; a synthetic current path ("::X") is one crumb "X".
+crumbs(root_path: string, root_name: string, current: string) -> ptr {
+    out = list.new()
+    _ = list.add(out, mk_crumb(root_name, root_path) as ptr)
+    if is_synthetic(current) == 1 {
+        _ = list.add(out, mk_crumb(string.substring(current, 2, string.length(current)), current) as ptr)
+        return out
+    }
+    base = root_path
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    if string.starts_with(current, base) == 0 { return out }
+    rest = string.substring(current, string.length(base), string.length(current))
+    acc = root_path
+    while string.length(rest) > 0 {
+        slash = string.index_of(rest, "/")
+        comp = rest
+        if slash >= 0 {
+            comp = string.substring(rest, 0, slash)
+            rest = string.substring(rest, slash + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        if string.length(comp) > 0 {
+            if string.ends_with(acc, "/") == 1 { acc = string.concat(acc, comp) }
+            else { acc = string.concat(acc, string.concat("/", comp)) }
+            _ = list.add(out, mk_crumb(comp, acc) as ptr)
+        }
+    }
+    return out
+}

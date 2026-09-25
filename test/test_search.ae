@@ -1,0 +1,105 @@
+// OpenDisk search (port of SearchIndexTests).
+// Tree: /Volumes/T{ Documents{ Report Final.pdf 900, drafts{ report-old.PDF 300 } },
+//                   Caches{}, movie.mov 2000 }
+import std.spec
+import std.list
+import std.string
+import od_tree
+import od_tree (Node, node_new, node_add, roll_up, node_for_path, remove_child)
+import od_search
+import od_search (Index, Results, index_build, search, SCOPE_ALL, SCOPE_FOLDERS, SCOPE_FILES)
+
+dir(p: *Node, name: string) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 1, 0)
+    node_add(p, n)
+    return n
+}
+file(p: *Node, name: string, size: long) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 0, size)
+    node_add(p, n)
+    return n
+}
+
+sample() -> *Node {
+    root = node_new("T", "/Volumes/T", 1, 0)
+    docs = dir(root, "Documents")
+    _r = file(docs, "Report Final.pdf", 900)
+    drafts = dir(docs, "drafts")
+    _o = file(drafts, "report-old.PDF", 300)
+    _c = dir(root, "Caches")
+    _m = file(root, "movie.mov", 2000)
+    _ = roll_up(root)
+    return root
+}
+
+item(r: *Results, i: int) -> *Node { return list.list_get_raw(r.items, i) as *Node }
+
+names(r: *Results) -> string {
+    out = ""
+    n = list.size(r.items)
+    i = 0
+    while i < n {
+        if i > 0 { out = string.concat(out, "|") }
+        out = string.concat(out, item(r, i).name)
+        i = i + 1
+    }
+    return out
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "search by name") {
+        spec.it("is case-insensitive, largest first, with full paths") callback {
+            ix = index_build(sample(), 0)
+            r = search(ix, "rEpOrT", SCOPE_ALL)
+            spec.assert_eq(r.total, 2, "two matches")
+            spec.assert_str_eq(names(r), "Report Final.pdf|report-old.PDF", "order")
+            spec.assert_str_eq(item(r, 0).path, "/Volumes/T/Documents/Report Final.pdf", "path")
+            spec.assert_eq_long(item(r, 0).size, 900, "size")
+        }
+        spec.it("scopes to folders or files") callback {
+            ix = index_build(sample(), 0)
+            f = search(ix, "d", SCOPE_FOLDERS)
+            spec.assert_str_eq(names(f), "Documents|drafts", "folders with d")
+            g = search(ix, "d", SCOPE_FILES)
+            spec.assert_str_eq(names(g), "Report Final.pdf|report-old.PDF", "files with d")
+        }
+        spec.it("ANDs the words of the query") callback {
+            ix = index_build(sample(), 0)
+            r = search(ix, "report old", SCOPE_ALL)
+            spec.assert_str_eq(names(r), "report-old.PDF", "only the old one")
+        }
+        spec.it("matches a decomposed accent against a composed query") callback {
+            root = node_new("T", "/T", 1, 0)
+            _f = file(root, "café.txt", 10)
+            ix = index_build(root, 0)
+            r = search(ix, "Café", SCOPE_ALL)
+            spec.assert_eq(r.total, 1, "café matches")
+        }
+        spec.it("never returns removed nodes or the root, and ignores blank queries") callback {
+            root = sample()
+            ix = index_build(root, 0)
+            _ = remove_child(root, node_for_path(root, "/Volumes/T/Documents"))
+            spec.assert_eq(search(ix, "report", SCOPE_ALL).total, 0, "removed subtree")
+            spec.assert_eq(search(ix, "Volumes", SCOPE_ALL).total, 0, "root's own path")
+            blank = search(ix, "   ", SCOPE_ALL)
+            spec.assert_eq(blank.total, 0, "blank")
+            spec.assert_eq(list.size(blank.items), 0, "blank is empty")
+        }
+        spec.it("keeps the largest 500 but counts every match") callback {
+            root = node_new("T", "/T", 1, 0)
+            i = 0
+            while i < 550 {
+                _f = file(root, "chunk-${i}.bin", i as long)
+                i = i + 1
+            }
+            ix = index_build(root, 0)
+            r = search(ix, "chunk", SCOPE_ALL)
+            spec.assert_eq(r.total, 550, "total")
+            spec.assert_eq(list.size(r.items), 500, "capped")
+            spec.assert_eq_long(item(r, 0).size, 549, "largest first")
+        }
+    }
+    return spec.run_summary(fw)
+}

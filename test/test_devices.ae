@@ -1,0 +1,57 @@
+// OpenDisk device list: which mounts count as volumes on each OS, and the
+// host's own list (Computer first).
+import std.spec
+import std.string
+import od_devices
+import od_devices (Device, list_devices, is_user_volume, device_count, device_at,
+    device_new, used_fraction)
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "which mounts are volumes") {
+        spec.it("macOS: what Finder shows under /Volumes") callback {
+            spec.assert_true(is_user_volume("macos", "/Volumes/External", "apfs"), "external")
+            spec.assert_true(is_user_volume("macos", "/Volumes/My SSD", "exfat"), "with a space")
+            spec.assert_false(is_user_volume("macos", "/", "apfs"), "the system disk")
+            spec.assert_false(is_user_volume("macos", "/System/Volumes/Data", "apfs"), "system volume")
+            spec.assert_false(is_user_volume("macos", "/dev", "devfs"), "devfs")
+            spec.assert_false(is_user_volume("macos", "/Volumes/.timemachine", "apfs"), "hidden")
+        }
+        spec.it("Linux: real filesystems, not the kernel's") callback {
+            spec.assert_true(is_user_volume("linux", "/media/usb", "vfat"), "usb stick")
+            spec.assert_true(is_user_volume("linux", "/run/media/alice/disk", "ext4"), "udisks")
+            spec.assert_true(is_user_volume("linux", "/mnt/data", "xfs"), "/mnt")
+            spec.assert_false(is_user_volume("linux", "/", "ext4"), "the system disk")
+            spec.assert_false(is_user_volume("linux", "/proc", "proc"), "proc")
+            spec.assert_false(is_user_volume("linux", "/sys/fs/cgroup", "cgroup2"), "cgroup")
+            spec.assert_false(is_user_volume("linux", "/run/user/1000", "tmpfs"), "tmpfs")
+            spec.assert_false(is_user_volume("linux", "/snap/core/1", "squashfs"), "snap")
+            spec.assert_false(is_user_volume("linux", "/boot/efi", "vfat"), "EFI partition")
+        }
+        spec.it("Windows: drive letters other than C:") callback {
+            spec.assert_true(is_user_volume("windows", "D:\\", "NTFS"), "D:")
+            spec.assert_true(is_user_volume("windows", "E:/", "exFAT"), "E:")
+            spec.assert_false(is_user_volume("windows", "C:\\", "NTFS"), "C: is Computer")
+        }
+    }
+
+    spec.describe(fw, "this machine") {
+        spec.it("lists Computer first, with its capacity") callback {
+            l = list_devices()
+            spec.assert_true(device_count(l) >= 1, "at least Computer")
+            c = device_at(l, 0)
+            spec.assert_str_eq(c.name, "Computer", "first is Computer")
+            spec.assert_eq(c.is_computer, 1, "flagged")
+            spec.assert_true(c.total >= c.available, "total ≥ available")
+            spec.assert_eq_long(c.used, c.total - c.available, "used = total - available")
+        }
+        spec.it("reports the used fraction") callback {
+            d = device_new("x", "/x", 1000, 250)
+            spec.assert_eq((used_fraction(d) * 100.0) as int, 75, "75% used")
+            e = device_new("y", "/y", 0, 0)
+            spec.assert_eq((used_fraction(e) * 100.0) as int, 0, "unknown capacity is 0")
+        }
+    }
+    return spec.run_summary(fw)
+}

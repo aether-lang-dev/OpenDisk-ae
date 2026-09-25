@@ -1,0 +1,60 @@
+// spec_scan_list.ae — OpenDisk: the scan finishes, the folder list shows
+// the fixture largest first, sorting, going into a folder and back through
+// the breadcrumbs. Run via spec/run.sh (fresh app + fixture each).
+import std.spec
+import std.string
+import od_driver
+import uidriver
+
+main() {
+    fw = spec.init()
+    od_driver.wait_for_app()
+
+    spec.describe(fw, "OpenDisk: scan + folder list") {
+        spec.it("finishes the scan and says how long it took") callback {
+            spec.assert_true(od_driver.wait_scan_done(40), "Scanned in …")
+            spec.assert_contains(od_driver.text_containing("Scanned in"), "Scanned in", "status")
+        }
+        spec.it("totals the folder in the status bar") callback {
+            t = od_driver.text_containing(" items")
+            spec.assert_contains(t, "MB", "a size in MB")
+            spec.assert_contains(t, "· 4 items", "four rows")
+            spec.assert_contains(od_driver.text_containing("available of"), "available of", "disk capacity")
+        }
+        spec.it("lists the contents largest first") callback {
+            spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "order")
+        }
+        spec.it("sorts by name, and back by size") callback {
+            nb = uidriver.widget_id_of("button", "Name")
+            uidriver.click_widget(nb)
+            spec.assert_str_eq(od_driver.list_names(), "Documents|Movies|Music|tiny.txt", "by name")
+            sb = uidriver.widget_id_of("button", "Size")
+            uidriver.click_widget(sb)
+            spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "by size")
+            spec.assert_true(uidriver.widget_id_of("button", "Size ▼") > 0, "size shows its direction")
+        }
+        spec.it("opens a folder when its row is clicked, with a crumb for it") callback {
+            od_driver.click_row("Documents")
+            want = string.concat(od_driver.fixture_name(), " > Documents")
+            spec.assert_true(od_driver.wait_crumbs(want, 20), "crumbs root > Documents")
+            spec.assert_str_eq(od_driver.list_names(), "report.pdf|drafts", "Documents' contents")
+        }
+        spec.it("goes deeper, and back up through a breadcrumb") callback {
+            od_driver.click_row("drafts")
+            want = string.concat(od_driver.fixture_name(), " > Documents > drafts")
+            spec.assert_true(od_driver.wait_crumbs(want, 20), "three crumbs")
+            spec.assert_str_eq(od_driver.list_names(), "report-old.pdf", "drafts' contents")
+            root_crumb = uidriver.widget_id_of("button", od_driver.fixture_name())
+            uidriver.click_widget(root_crumb)
+            spec.assert_true(od_driver.wait_crumbs(od_driver.fixture_name(), 20), "back at the root")
+            spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "root again")
+        }
+        spec.it("rescans with Ctrl+R") callback {
+            fired = uidriver.window_key("Ctrl+R")
+            spec.assert_eq(fired, 1, "Ctrl+R handled")
+            spec.assert_true(od_driver.wait_scan_done(40), "scanned again")
+            spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "same contents")
+        }
+    }
+    return spec.run_summary(fw)
+}

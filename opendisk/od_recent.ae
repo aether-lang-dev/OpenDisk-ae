@@ -1,0 +1,106 @@
+// od_recent.ae — folders you scanned before, offered again on the device
+// screen. OpenDisk's App Store build keeps a list of granted folders; this
+// is its portable counterpart (no sandbox bookmarks off macOS): newest
+// first, at most RECENT_MAX, one path per line in
+//   $OPENDISK_CONFIG_DIR/recent.txt, else
+//   macOS    ~/Library/Application Support/OpenDisk/recent.txt
+//   Windows  %APPDATA%/OpenDisk/recent.txt
+//   Linux    ${XDG_CONFIG_HOME:-~/.config}/opendisk/recent.txt
+
+exports (recent_load, recent_add, recent_remove, config_dir, RECENT_MAX)
+
+import std.string
+import std.strarr
+import std.fs
+import std.os
+import std.os (os_getenv)
+import od_protected
+
+const RECENT_MAX: int = 8
+
+env_or(name: string, fallback: string) -> string {
+    v = os_getenv(name)
+    if v == null { return fallback }
+    if string.length(v) == 0 { return fallback }
+    return v
+}
+
+config_dir() -> string {
+    over = env_or("OPENDISK_CONFIG_DIR", "")
+    if string.length(over) > 0 { return over }
+    home = od_protected.home_dir()
+    os = od_protected.host_os()
+    if string.equals(os, "macos") == 1 {
+        return string.concat(home, "/Library/Application Support/OpenDisk")
+    }
+    if string.equals(os, "windows") == 1 {
+        return string.concat(string.replace_all(env_or("APPDATA", home), "\\", "/"), "/OpenDisk")
+    }
+    return string.concat(env_or("XDG_CONFIG_HOME", string.concat(home, "/.config")), "/opendisk")
+}
+
+file_path() -> string { return string.concat(config_dir(), "/recent.txt") }
+
+// The remembered folders that still exist, newest first.
+recent_load() -> ptr {
+    out = strarr.new()
+    body, err = fs.read(file_path())
+    if string.length(err) > 0 { return out }
+    rest = body
+    while string.length(rest) > 0 {
+        nl = string.index_of(rest, "\n")
+        line = rest
+        if nl >= 0 {
+            line = string.substring(rest, 0, nl)
+            rest = string.substring(rest, nl + 1, string.length(rest))
+        } else {
+            rest = ""
+        }
+        line = string.trim(line)
+        if string.length(line) > 0 {
+            if fs.exists(line) == 1 {
+                if strarr.size(out) < RECENT_MAX { _ = strarr.push_copy(out, line) }
+            }
+        }
+    }
+    return out
+}
+
+save(l: ptr) {
+    _m = fs.mkdir_p(config_dir())
+    body = ""
+    i = 0
+    while i < strarr.size(l) {
+        body = string.concat(body, string.concat(strarr.get(l, i), "\n"))
+        i = i + 1
+    }
+    _w = fs.write(file_path(), body)
+}
+
+// Remember `path` as the newest.
+recent_add(path: string) {
+    old = recent_load()
+    l = strarr.new()
+    _ = strarr.push_copy(l, path)
+    i = 0
+    while i < strarr.size(old) {
+        p = strarr.get(old, i)
+        if string.equals(p, path) == 0 {
+            if strarr.size(l) < RECENT_MAX { _ = strarr.push_copy(l, p) }
+        }
+        i = i + 1
+    }
+    save(l)
+}
+
+recent_remove(path: string) {
+    old = recent_load()
+    l = strarr.new()
+    i = 0
+    while i < strarr.size(old) {
+        p = strarr.get(old, i)
+        if string.equals(p, path) == 0 { _ = strarr.push_copy(l, p) }
+        i = i + 1
+    }
+    save(l)
+}

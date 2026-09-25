@@ -1,0 +1,27 @@
+// od_stat.ae — lstat facts OpenDisk sizes by (allocated bytes, device,
+// file id, link count). The C lives beside this module (od_stat.c).
+@source("od_stat.c")
+
+exports (stat_try, stat_kind, stat_alloc, stat_size, stat_dev, stat_ino, stat_nlink,
+    KIND_FILE, KIND_DIR, KIND_LINK, KIND_OTHER)
+
+const KIND_FILE: int = 1
+const KIND_DIR: int = 2
+const KIND_LINK: int = 3
+const KIND_OTHER: int = 4
+
+extern od_stat_try(path: string) -> int
+extern od_stat_kind() -> int
+extern od_stat_alloc() -> long
+extern od_stat_size() -> long
+extern od_stat_dev() -> long
+extern od_stat_ino() -> long
+extern od_stat_nlink() -> int
+
+stat_try(path: string) -> int { return od_stat_try(path) }
+stat_kind() -> int { return od_stat_kind() }
+stat_alloc() -> long { return od_stat_alloc() }
+stat_size() -> long { return od_stat_size() }
+stat_dev() -> long { return od_stat_dev() }
+stat_ino() -> long { return od_stat_ino() }
+stat_nlink() -> int { return od_stat_nlink() }

@@ -1,0 +1,171 @@
+// od_devices.ae — the disks OpenDisk offers to scan.
+//
+// Port of OpenDisk's DeviceMonitor (MIT, © 137137137): "Computer" (the
+// system disk) first, then the other mounted volumes a user would recognise,
+// sorted by path, each with its capacity. A volume shows only when its
+// capacity can be read. Which mounts count is per OS:
+//   macOS    the volumes under /Volumes (what Finder shows)
+//   Linux    real filesystems, not the kernel's pseudo ones or system mounts
+//   Windows  drive letters (C: is "Computer")
+// is_user_volume takes the OS as a parameter so the rules are testable on
+// any machine; list_devices applies the host's.
+
+exports (Device, list_devices, is_user_volume, device_new, device_count, device_at,
+    used_fraction)
+
+import std.string
+import std.list
+import std.fs
+import od_protected
+import od_tree
+
+extern malloc(size: int) -> ptr
+
+struct Device {
+    name: string,
+    path: string,
+    long total,
+    long available,
+    long used,
+    is_computer: int
+}
+
+device_new(name: string, path: string, total: long, available: long) -> *Device {
+    d = malloc(sizeof(Device)) as *Device
+    d.name = name
+    d.path = path
+    d.total = total
+    d.available = available
+    d.used = total - available
+    if d.used < 0 { d.used = 0 }
+    d.is_computer = 0
+    return d
+}
+
+device_count(l: ptr) -> int { return list.size(l) }
+device_at(l: ptr, i: int) -> *Device { return list.list_get_raw(l, i) as *Device }
+
+used_fraction(d: *Device) -> float {
+    if d.total <= 0 { return 0.0 }
+    return (d.used as float) / (d.total as float)
+}
+
+const PSEUDO_FS: string = "|proc|sysfs|tmpfs|devtmpfs|devpts|cgroup|cgroup2|securityfs|pstore|bpf|debugfs|tracefs|configfs|fusectl|mqueue|hugetlbfs|autofs|rpc_pipefs|binfmt_misc|squashfs|overlay|nsfs|efivarfs|ramfs|devfs|fdescfs|nullfs|linprocfs|linsysfs|selinuxfs|fuse.portal|fuse.gvfsd-fuse|fuse.snapfuse|zram|swap|"
+
+in_bar_set(set: string, item: string) -> int {
+    return string.contains(set, string.concat("|", string.concat(item, "|")))
+}
+
+// Should the mount at `point` (filesystem `fstype`) be offered on `os`?
+// The system disk itself is not a "volume" here (it is "Computer").
+is_user_volume(os: string, point: string, fstype: string) -> int {
+    if string.equals(os, "macos") == 1 {
+        if string.starts_with(point, "/Volumes/") == 0 { return 0 }
+        rest = string.substring(point, 9, string.length(point))
+        if string.length(rest) == 0 { return 0 }
+        if string.contains(rest, "/") == 1 { return 0 }
+        if string.starts_with(rest, ".") == 1 { return 0 }
+        return 1
+    }
+    if string.equals(os, "windows") == 1 {
+        p = string.to_upper(string.replace_all(point, "\\", "/"))
+        if string.length(p) < 2 { return 0 }
+        if string.equals(string.substring(p, 1, 2), ":") == 0 { return 0 }
+        if string.starts_with(p, "C:") == 1 { return 0 }
+        return 1
+    }
+    // Linux / BSD
+    if string.equals(point, "/") == 1 { return 0 }
+    if in_bar_set(PSEUDO_FS, fstype) == 1 { return 0 }
+    if string.starts_with(fstype, "fuse.") == 1 {
+        if string.equals(fstype, "fuse.sshfs") == 0 {
+            if string.starts_with(fstype, "fuse.rclone") == 0 { return 0 }
+        }
+    }
+    if string.starts_with(point, "/proc") == 1 { return 0 }
+    if string.starts_with(point, "/sys") == 1 { return 0 }
+    if string.starts_with(point, "/dev") == 1 { return 0 }
+    if string.starts_with(point, "/snap/") == 1 { return 0 }
+    if string.starts_with(point, "/boot") == 1 { return 0 }
+    if string.starts_with(point, "/var/lib/") == 1 { return 0 }
+    if string.starts_with(point, "/run/") == 1 {
+        if string.starts_with(point, "/run/media/") == 0 { return 0 }
+    }
+    return 1
+}
+
+system_disk_path(os: string) -> string {
+    if string.equals(os, "windows") == 1 { return "C:/" }
+    return "/"
+}
+
+// Capacity via statvfs; on Windows (no statvfs) the device still lists,
+// with total 0 (the row then shows no capacity).
+capacity_device(name: string, path: string) -> *Device {
+    total, _free, avail, err = fs.statvfs(path)
+    if string.length(err) > 0 {
+        return device_new(name, path, 0, 0)
+    }
+    return device_new(name, path, total, avail)
+}
+
+// "Computer" first, then the user volumes sorted by path.
+list_devices() -> ptr {
+    os = od_protected.host_os()
+    out = list.new()
+    comp = capacity_device("Computer", system_disk_path(os))
+    comp.is_computer = 1
+    _ = list.add(out, comp as ptr)
+    vols = list.new()
+    n, merr = fs.mounts()
+    if string.length(merr) == 0 {
+        i = 0
+        while i < n {
+            pt = fs.mount_point(i)
+            ft = fs.mount_fstype(i)
+            if is_user_volume(os, pt, ft) == 1 {
+                if fs.exists(pt) == 1 {
+                    if has_path(vols, pt) == 0 {
+                        _ = list.add(vols, capacity_device(od_tree.last_component(pt), pt) as ptr)
+                    }
+                }
+            }
+            i = i + 1
+        }
+        fs.fs_release_mounts()
+    }
+    sort_by_path(vols)
+    j = 0
+    while j < list.size(vols) {
+        _ = list.add(out, list.list_get_raw(vols, j))
+        j = j + 1
+    }
+    return out
+}
+
+has_path(l: ptr, p: string) -> int {
+    i = 0
+    while i < list.size(l) {
+        if string.equals(device_at(l, i).path, p) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Few volumes: insertion sort.
+sort_by_path(l: ptr) {
+    n = list.size(l)
+    i = 1
+    while i < n {
+        cur = list.list_get_raw(l, i)
+        cp = (cur as *Device).path
+        j = i - 1
+        while j >= 0 {
+            if string.compare(device_at(l, j).path, cp) <= 0 { break }
+            list.list_set(l, j + 1, list.list_get_raw(l, j))
+            j = j - 1
+        }
+        list.list_set(l, j + 1, cur)
+        i = i + 1
+    }
+}

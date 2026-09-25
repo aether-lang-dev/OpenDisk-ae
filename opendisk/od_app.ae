@@ -1,0 +1,862 @@
+// od_app.ae — OpenDisk's app state and everything the window does: the
+// scan heartbeat, navigation, search, sorting, the Collector, deletion, and
+// pushing the model into the widgets. opendisk.ae builds the window and
+// wires its events here.
+//
+// Port of OpenDisk's DiskAnalysisView / DiskAnalyzer behaviour (MIT,
+// © 137137137); see the od_* modules for the rules themselves.
+
+exports (
+    App, app_new, now_s, start_analysis, begin_scan, tick, refresh, refresh_devices,
+    navigate_to, go_back, row_clicked, set_query, toggle_sort, collect_paths,
+    collect_row, collect_hovered, uncollect, undo_collect, ask_delete, confirm_delete,
+    cancel_delete, ask_unmount, confirm_unmount, cancel_unmount, chart_move, chart_click,
+    open_path, reveal_path, copy_path, rescan, row_at_index, sort_label,
+    show_picker, scan_folder, chart_paint, VB
+)
+
+import ui
+import ui (set_text, set_progress, set_hidden, set_button_label, listbox_update,
+    each_update, clipboard_write, open_url, pick_folder, a11y_label, a11y_description,
+    overlay_modal, dismiss_overlay, root_vstack, text, btn, hstack, spacer)
+import vg
+import vg.live (vg_flush_live)
+import std.string
+import std.list
+import std.strarr
+import std.os
+import std.os (os_getenv)
+import std.fs
+import od_tree
+import od_tree (Node, node_for_path, parent_path, last_component, roll_up)
+import od_scan
+import od_scan (Scan, scan_new, scan_step, scan_cancel)
+import od_chart
+import od_chart (Chart, Seg, chart_build, chart_build_list, chart_layout, chart_hit)
+import od_search
+import od_search (Index, Results, index_build, search, SCOPE_ALL)
+import od_collector
+import od_collector (Collector, Item, collector_new, item_new)
+import od_view
+import od_view (Row, rows_for, row_at, sort_rows, cache_rows, crumbs, PURGEABLE_PATH,
+    PURGEABLE_NAME, SORT_SIZE, SORT_NAME, is_synthetic)
+import od_fmt
+import od_protected
+import od_devices
+import od_recent
+import od_draw
+
+extern malloc(size: int) -> ptr
+extern aether_ui_set_enabled(handle: int, enabled: int)
+
+// The chart's coordinate space (a square; the canvas scales it to fit).
+const VB: float = 500.0
+
+struct App {
+    // screens
+    picker: int,
+    analysis: int,
+    devices: ptr,           // ui.each of device rows
+    recents: ptr,           // ui.each of recent-folder rows
+    recents_title: int,
+    // analysis widgets
+    title: int,
+    subtitle: int,
+    search_field: int,
+    crumbs: ptr,            // ui.each of crumb buttons
+    list: ptr,              // ui.listbox of rows
+    summary: int,
+    name_btn: int,
+    size_btn: int,
+    status: int,
+    progress: int,
+    capacity: int,
+    total_lbl: int,
+    col_title: int,
+    col_sub: int,
+    col_notice: int,
+    col_delete: int,
+    col_progress: int,
+    col_items: ptr,         // ui.each of collected items
+    cid: int,
+    cwid: int,
+    scene: ptr,
+    overlay: int,
+    // the scan
+    root_path: string,
+    root_name: string,
+    long used_total,
+    long cap_total,
+    long cap_avail,
+    scan: *Scan,
+    scanning: int,
+    scan_t0: float,
+    scan_secs: float,
+    last_refresh: float,
+    root: *Node,
+    // where we are: a folder path under the root, or PURGEABLE_PATH
+    current: string,
+    back: ptr,              // strarr of earlier `current`s
+    rows: ptr,              // list of *Row on screen
+    searching: int,
+    query: string,
+    index: *Index,
+    results: *Results,
+    sort_mode: int,
+    sort_asc: int,
+    // the chart
+    chart: *Chart,
+    hovered: *Seg,
+    mx: float,
+    my: float,
+    dirty: int,
+    // the Collector
+    col: *Collector,
+    notice_t: float,
+    del_done_t: float,
+    // housekeeping
+    now: float,
+    os: string,
+    home: string
+}
+
+app_new() -> *App {
+    a = malloc(sizeof(App)) as *App
+    a.picker = 0
+    a.analysis = 0
+    a.devices = null
+    a.recents = null
+    a.recents_title = 0
+    a.title = 0
+    a.subtitle = 0
+    a.search_field = 0
+    a.crumbs = null
+    a.list = null
+    a.summary = 0
+    a.name_btn = 0
+    a.size_btn = 0
+    a.status = 0
+    a.progress = 0
+    a.capacity = 0
+    a.total_lbl = 0
+    a.col_title = 0
+    a.col_sub = 0
+    a.col_notice = 0
+    a.col_delete = 0
+    a.col_progress = 0
+    a.col_items = null
+    a.cid = 0
+    a.cwid = 0
+    a.scene = null
+    a.overlay = 0
+    a.root_path = ""
+    a.root_name = ""
+    a.used_total = 0
+    a.cap_total = 0
+    a.cap_avail = 0
+    a.scan = null as *Scan
+    a.scanning = 0
+    a.scan_t0 = 0.0
+    a.scan_secs = 0.0
+    a.last_refresh = 0.0
+    a.root = null as *Node
+    a.current = ""
+    a.back = strarr.new()
+    a.rows = list.new()
+    a.searching = 0
+    a.query = ""
+    a.index = null as *Index
+    a.results = null as *Results
+    a.sort_mode = SORT_SIZE
+    a.sort_asc = 0
+    a.chart = null as *Chart
+    a.hovered = null as *Seg
+    a.mx = 0.0
+    a.my = 0.0
+    a.dirty = 1
+    a.col = collector_new()
+    a.notice_t = 0.0
+    a.del_done_t = 0.0
+    a.now = 0.0
+    a.os = od_protected.host_os()
+    a.home = od_protected.home_dir()
+    return a
+}
+
+now_s() -> float {
+    long ns = os.now_monotonic_ns()
+    return (ns as float) / 1000000000.0
+}
+
+headless() -> int {
+    if os_getenv("AETHER_UI_HEADLESS") != null { return 1 }
+    return 0
+}
+
+// ─── Screens ──────────────────────────────────────────────────────
+
+refresh_devices(a: *App) {
+    if a.devices != null { each_update(a.devices, od_devices.list_devices()) }
+    if a.recents != null {
+        rec = od_recent.recent_load()
+        l = list.new()
+        i = 0
+        while i < strarr.size(rec) {
+            p = strarr.get(rec, i)
+            _ = list.add(l, od_devices.device_new(last_component(p), p, 0, 0) as ptr)
+            i = i + 1
+        }
+        each_update(a.recents, l)
+        if a.recents_title != 0 {
+            _h = set_hidden(a.recents_title, list.size(l) == 0)
+        }
+    }
+}
+
+show_picker(a: *App) {
+    if a.scanning == 1 {
+        scan_cancel(a.scan)
+        a.scanning = 0
+    }
+    refresh_devices(a)
+    _h1 = set_hidden(a.analysis, 1)
+    _h2 = set_hidden(a.picker, 0)
+}
+
+// Open the analysis screen on `path` (a disk: `used` bytes in use, for the
+// progress bar; a folder: 0 — the bar then shows no fraction).
+start_analysis(a: *App, path: string, name: string, used: long) {
+    a.root_path = path
+    a.root_name = name
+    a.used_total = used
+    a.searching = 0
+    a.query = ""
+    if a.search_field != 0 { _t = set_text(a.search_field, "") }
+    if a.title != 0 { _t2 = set_text(a.title, name) }
+    _h1 = set_hidden(a.picker, 1)
+    _h2 = set_hidden(a.analysis, 0)
+    if used == 0 { od_recent.recent_add(path) }
+    begin_scan(a, path)
+}
+
+// "Scan Folder…": pick one, then analyse it.
+scan_folder(a: *App) {
+    p = pick_folder("Choose a folder to analyze", a.home)
+    if string.length(p) == 0 { return }
+    nm = last_component(p)
+    if string.length(nm) == 0 { nm = p }
+    start_analysis(a, p, nm, 0)
+}
+
+read_capacity(a: *App) {
+    total, _free, avail, err = fs.statvfs(a.root_path)
+    if string.length(err) == 0 {
+        a.cap_total = total
+        a.cap_avail = avail
+    } else {
+        a.cap_total = 0
+        a.cap_avail = 0
+    }
+}
+
+begin_scan(a: *App, path: string) {
+    if a.scanning == 1 { scan_cancel(a.scan) }
+    a.root_path = path
+    a.scan = scan_new(path, a.root_name)
+    a.root = a.scan.root
+    a.current = path
+    a.back = strarr.new()
+    a.scanning = 1
+    a.scan_t0 = a.now
+    a.scan_secs = 0.0
+    a.last_refresh = 0.0
+    a.index = null as *Index
+    a.results = null as *Results
+    a.hovered = null as *Seg
+    read_capacity(a)
+    refresh(a)
+}
+
+// Refresh: rescan the folder being looked at (OpenDisk makes it the root).
+rescan(a: *App) {
+    p = a.current
+    if is_synthetic(p) == 1 { p = a.root_path }
+    if string.equals(p, a.root_path) == 0 { a.root_name = last_component(p) }
+    begin_scan(a, p)
+}
+
+// ─── The heartbeat ────────────────────────────────────────────────
+
+tick(a: *App) {
+    a.now = now_s()
+    if a.scanning == 1 {
+        // ~15 ms of scanning per 33 ms frame keeps the window responsive.
+        t_end = a.now + 0.015
+        more = 1
+        while more == 1 {
+            more = scan_step(a.scan, 4)
+            if now_s() > t_end { break }
+        }
+        if more == 0 {
+            finish_scan(a)
+        } else {
+            refresh_status(a)
+            if a.now - a.last_refresh > 0.5 {
+                _ = roll_up(a.root)
+                a.last_refresh = a.now
+                refresh(a)
+            }
+        }
+    }
+    if od_collector.deleting(a.col) == 1 {
+        if od_collector.delete_step(a.col) == 0 { finish_delete(a) }
+        refresh_collector(a)
+    }
+    if a.del_done_t > 0.0 {
+        if a.now - a.del_done_t > 2.0 {
+            a.del_done_t = 0.0
+            refresh_collector(a)
+        }
+    }
+    if a.notice_t > 0.0 {
+        if a.now - a.notice_t > 3.5 {
+            a.notice_t = 0.0
+            a.col.notice = ""
+            refresh_collector(a)
+        }
+    }
+    if a.dirty == 1 { repaint(a) }
+}
+
+finish_scan(a: *App) {
+    a.scanning = 0
+    _ = roll_up(a.root)
+    a.scan_secs = a.now - a.scan_t0
+    a.index = index_build(a.root, 0)
+    // the folder being looked at may be gone now
+    if is_synthetic(a.current) == 0 {
+        if node_for_path(a.root, a.current) == null { a.current = a.root_path }
+    }
+    read_capacity(a)
+    if a.searching == 1 { a.results = search(a.index, a.query, SCOPE_ALL) }
+    refresh(a)
+}
+
+// ─── Navigation ───────────────────────────────────────────────────
+
+navigate_to(a: *App, path: string) {
+    if string.equals(path, a.current) == 1 { return }
+    if is_synthetic(path) == 0 {
+        n = node_for_path(a.root, path)
+        if n == null { return }
+        if n.is_dir == 0 { return }
+    }
+    // Going to an earlier crumb truncates the history there.
+    k = strarr.size(a.back)
+    found = -1
+    i = 0
+    while i < k {
+        if string.equals(strarr.get(a.back, i), path) == 1 { found = i }
+        i = i + 1
+    }
+    if found >= 0 {
+        nb = strarr.new()
+        j = 0
+        while j < found {
+            _ = strarr.push_copy(nb, strarr.get(a.back, j))
+            j = j + 1
+        }
+        a.back = nb
+    } else {
+        _ = strarr.push_copy(a.back, a.current)
+    }
+    a.current = path
+    a.hovered = null as *Seg
+    refresh(a)
+}
+
+go_back(a: *App) {
+    k = strarr.size(a.back)
+    if k == 0 { return }
+    prev = strarr.get(a.back, k - 1)
+    nb = strarr.new()
+    j = 0
+    while j < k - 1 {
+        _ = strarr.push_copy(nb, strarr.get(a.back, j))
+        j = j + 1
+    }
+    a.back = nb
+    a.current = prev
+    a.hovered = null as *Seg
+    refresh(a)
+}
+
+row_at_index(a: *App, i: int) -> *Row {
+    if i < 0 { return null as *Row }
+    if i >= list.size(a.rows) { return null as *Row }
+    return row_at(a.rows, i)
+}
+
+// A plain click: a folder opens; in search results, a hit opens its folder
+// (the item itself when it is a folder) and the search closes.
+row_clicked(a: *App, i: int) {
+    r = row_at_index(a, i)
+    if r == null { return }
+    if a.searching == 1 {
+        dest = r.path
+        if r.is_dir == 0 { dest = parent_path(r.path) }
+        a.searching = 0
+        a.query = ""
+        if a.search_field != 0 { _t = set_text(a.search_field, "") }
+        navigate_to(a, dest)
+        refresh(a)
+        return
+    }
+    if r.is_dir == 1 { navigate_to(a, r.path) }
+}
+
+set_query(a: *App, q: string) {
+    t = string.trim(q)
+    if string.length(t) == 0 {
+        a.searching = 0
+        a.query = ""
+        refresh(a)
+        return
+    }
+    a.searching = 1
+    a.query = t
+    ix = a.index
+    if ix == null { ix = index_build(a.root, a.scanning) }
+    if a.scanning == 1 { ix = index_build(a.root, 1) }
+    a.results = search(ix, t, SCOPE_ALL)
+    refresh(a)
+}
+
+// Name: ascending first; Size: descending first; the active one flips.
+toggle_sort(a: *App, mode: int) {
+    if a.sort_mode == mode {
+        if a.sort_asc == 1 { a.sort_asc = 0 } else { a.sort_asc = 1 }
+    } else {
+        a.sort_mode = mode
+        a.sort_asc = 0
+        if mode == SORT_NAME { a.sort_asc = 1 }
+    }
+    refresh(a)
+}
+
+sort_label(a: *App, mode: int) -> string {
+    base = "Size"
+    if mode == SORT_NAME { base = "Name" }
+    if a.sort_mode != mode { return base }
+    if a.sort_asc == 1 { return string.concat(base, " ▲") }
+    return string.concat(base, " ▼")
+}
+
+// ─── Chart ────────────────────────────────────────────────────────
+
+current_node(a: *App) -> *Node {
+    if a.root == null { return null as *Node }
+    if is_synthetic(a.current) == 1 { return null as *Node }
+    return node_for_path(a.root, a.current)
+}
+
+build_chart(a: *App) {
+    a.chart = null as *Chart
+    if a.root == null { return }
+    if string.equals(a.current, PURGEABLE_PATH) == 1 {
+        caches = cache_rows(a.root, a.os, a.home)
+        kids = list.new()
+        long total = 0
+        i = 0
+        while i < list.size(caches) {
+            r = row_at(caches, i)
+            if r.node != null {
+                _ = list.add(kids, r.node as ptr)
+                total = total + r.size
+            }
+            i = i + 1
+        }
+        a.chart = chart_build_list(PURGEABLE_NAME, null as *Node, total, kids)
+    } else {
+        n = current_node(a)
+        if n == null { return }
+        nm = last_component(n.path)
+        if string.equals(n.path, a.root_path) == 1 { nm = a.root_name }
+        a.chart = chart_build(n, nm)
+    }
+    if a.chart != null { chart_layout(a.chart, VB, VB) }
+}
+
+repaint(a: *App) {
+    if a.cid == 0 { return }
+    ui.canvas_clear(a.cid)
+    vg_flush_live(a.scene, a.cid, a.now)
+    ui.canvas_redraw(a.cid)
+    a.dirty = 0
+    // Debug/test aid: $OPENDISK_CHART_PNG=<file> snapshots every repaint
+    // off-screen (works with no display, and where screenshots are blank).
+    snap = os_getenv("OPENDISK_CHART_PNG")
+    if snap != null {
+        if string.length(snap) > 0 { _w = ui.canvas_write_png(a.cid, snap, 500, 500) }
+    }
+}
+
+// The draw callback (from the vg region): paint the chart as it stands.
+chart_paint(a: *App, rn: ptr) {
+    od_draw.draw_chart(rn, a.chart, a.hovered, a.mx, a.my, VB, VB)
+}
+
+describe_seg(a: *App, s: *Seg) -> string {
+    return "${s.name}, ${od_fmt.file_size(s.size)}, ${od_fmt.pct1(s.fraction)} percent"
+}
+
+// Pointer moved over the chart (viewBox units).
+chart_move(a: *App, x: float, y: float) {
+    a.mx = x
+    a.my = y
+    s = chart_hit(a.chart, x, y)
+    if s != a.hovered {
+        a.hovered = s
+        a.dirty = 1
+        if a.cwid != 0 {
+            if s == null { _d = a11y_description(a.cwid, "") }
+            else { _d2 = a11y_description(a.cwid, describe_seg(a, s)) }
+        }
+    } else {
+        if s != null { a.dirty = 1 }    // the tip follows the pointer
+    }
+}
+
+// Click: the centre goes back; a folder opens; a file does nothing.
+chart_click(a: *App, x: float, y: float) {
+    s = chart_hit(a.chart, x, y)
+    if s == null { return }
+    if s.depth == 0 {
+        go_back(a)
+        return
+    }
+    if s.is_dir == 1 {
+        if string.length(s.path) > 0 { navigate_to(a, s.path) }
+    }
+}
+
+// ─── The Collector ────────────────────────────────────────────────
+
+size_of_path(a: *App, p: string) -> *Item {
+    if a.root != null {
+        n = node_for_path(a.root, p)
+        if n != null { return item_new(p, n.size, n.is_dir) }
+    }
+    kind, size, _m, err = fs.file_stat(p)
+    if string.length(err) > 0 { return item_new(p, 0, 0) }
+    isd = 0
+    if kind == 2 { isd = 1 }
+    return item_new(p, size, isd)
+}
+
+// Collect paths (a drop, a menu choice): one undo step. The Purgeable row
+// stands for its cache folders.
+collect_paths(a: *App, paths: ptr) {
+    items = list.new()
+    i = 0
+    while i < strarr.size(paths) {
+        p = strarr.get(paths, i)
+        if string.equals(p, PURGEABLE_PATH) == 1 {
+            caches = cache_rows(a.root, a.os, a.home)
+            j = 0
+            while j < list.size(caches) {
+                r = row_at(caches, j)
+                _ = list.add(items, item_new(r.path, r.size, 1) as ptr)
+                j = j + 1
+            }
+        } else {
+            _ = list.add(items, size_of_path(a, p) as ptr)
+        }
+        i = i + 1
+    }
+    _n = od_collector.add_batch(a.col, items)
+    if string.length(a.col.notice) > 0 { a.notice_t = a.now }
+    refresh(a)
+}
+
+collect_row(a: *App, r: *Row) {
+    if r == null { return }
+    one = strarr.new()
+    _ = strarr.push_copy(one, r.path)
+    collect_paths(a, one)
+}
+
+collect_hovered(a: *App) {
+    s = a.hovered
+    if s == null { return }
+    if s.depth == 0 { return }
+    one = strarr.new()
+    _ = strarr.push_copy(one, s.path)
+    collect_paths(a, one)
+}
+
+uncollect(a: *App, path: string) {
+    _r = od_collector.remove(a.col, path)
+    refresh(a)
+}
+
+undo_collect(a: *App) {
+    if a.searching == 1 { return }
+    _u = od_collector.undo(a.col)
+    refresh(a)
+}
+
+close_overlay(a: *App) {
+    if a.overlay != 0 {
+        dismiss_overlay(a.overlay)
+        a.overlay = 0
+    }
+}
+
+// "Delete N items?" — the confirmation card.
+ask_delete(a: *App) {
+    n = od_collector.count(a.col)
+    if n == 0 { return }
+    close_overlay(a)
+    what = "item"
+    if n != 1 { what = "items" }
+    card = root_vstack(10)
+    _t = text(card, "Delete ${n} ${what}?")
+    _m = text(card, "This permanently deletes the collected items and can’t be undone.")
+    row = hstack(card, 8)
+    _c = btn(row, "Cancel") callback { cancel_delete(a) }
+    _d = btn(row, string.concat("Delete ", od_fmt.file_size(od_collector.total_bytes(a.col)))) callback {
+        confirm_delete(a)
+    }
+    a.overlay = overlay_modal(0, card, "center", 0, 0) callback { a.overlay = 0 }
+}
+
+cancel_delete(a: *App) { close_overlay(a) }
+
+confirm_delete(a: *App) {
+    close_overlay(a)
+    od_collector.delete_begin(a.col)
+    refresh_collector(a)
+}
+
+finish_delete(a: *App) {
+    a.del_done_t = a.now
+    // what was deleted is gone from disk: start again from the root
+    a.root_name = a.root_name
+    begin_scan(a, a.root_path)
+}
+
+ask_unmount(a: *App) {
+    close_overlay(a)
+    card = root_vstack(10)
+    _t = text(card, "Unmount ${a.root_name}?")
+    _m = text(card, "This clears the current scan data and returns to disk selection. It does not eject the disk.")
+    row = hstack(card, 8)
+    _c = btn(row, "Cancel") callback { cancel_unmount(a) }
+    _u = btn(row, "Unmount") callback { confirm_unmount(a) }
+    a.overlay = overlay_modal(0, card, "center", 0, 0) callback { a.overlay = 0 }
+}
+
+cancel_unmount(a: *App) { close_overlay(a) }
+
+confirm_unmount(a: *App) {
+    close_overlay(a)
+    a.root = null as *Node
+    a.chart = null as *Chart
+    a.current = ""
+    a.dirty = 1
+    show_picker(a)
+}
+
+// ─── Files ────────────────────────────────────────────────────────
+
+file_url(p: string) -> string {
+    e = string.replace_all(p, "%", "%25")
+    e = string.replace_all(e, " ", "%20")
+    e = string.replace_all(e, "#", "%23")
+    e = string.replace_all(e, "?", "%3F")
+    if string.starts_with(e, "/") == 1 { return string.concat("file://", e) }
+    return string.concat("file:///", e)
+}
+
+open_path(a: *App, p: string) {
+    if headless() == 1 {
+        _t = set_text(a.status, string.concat("Open: ", p))
+        return
+    }
+    open_url(file_url(p))
+}
+
+reveal_path(a: *App, p: string) {
+    d = p
+    kind, _s, _m, err = fs.file_stat(p)
+    if string.length(err) == 0 { if kind != 2 { d = parent_path(p) } }
+    if headless() == 1 {
+        _t = set_text(a.status, string.concat("Show in file manager: ", d))
+        return
+    }
+    open_url(file_url(d))
+}
+
+copy_path(a: *App, p: string) {
+    clipboard_write(p)
+    _t = set_text(a.status, string.concat("Copied: ", p))
+}
+
+// ─── Pushing the model into the widgets ───────────────────────────
+
+refresh(a: *App) {
+    refresh_list(a)
+    refresh_crumbs(a)
+    build_chart(a)
+    a.dirty = 1
+    refresh_status(a)
+    refresh_collector(a)
+}
+
+refresh_list(a: *App) {
+    if a.list == null { return }
+    rows = list.new()
+    if a.searching == 1 {
+        if a.results != null {
+            i = 0
+            while i < list.size(a.results.items) {
+                n = list.list_get_raw(a.results.items, i) as *Node
+                if od_collector.contains(a.col, n.path) == 0 {
+                    _ = list.add(rows, od_view.row_of(n) as ptr)
+                }
+                i = i + 1
+            }
+            if a.summary != 0 {
+                _s = set_text(a.summary, od_view.search_summary(list.size(a.results.items),
+                    a.results.total, a.results.partial))
+            }
+        }
+        if a.summary != 0 { _h = set_hidden(a.summary, 0) }
+    } else {
+        if a.summary != 0 { _h2 = set_hidden(a.summary, 1) }
+        if string.equals(a.current, PURGEABLE_PATH) == 1 {
+            rows = cache_rows(a.root, a.os, a.home)
+        } else {
+            n = current_node(a)
+            at_root = 0
+            if string.equals(a.current, a.root_path) == 1 { at_root = 1 }
+            rows = rows_for(n, at_root, a.scanning, a.col, a.os, a.home)
+        }
+        sort_rows(rows, a.sort_mode, a.sort_asc)
+    }
+    a.rows = rows
+    listbox_update(a.list, rows)
+    if a.name_btn != 0 { _n = set_button_label(a.name_btn, sort_label(a, SORT_NAME)) }
+    if a.size_btn != 0 { _z = set_button_label(a.size_btn, sort_label(a, SORT_SIZE)) }
+}
+
+refresh_crumbs(a: *App) {
+    if a.crumbs == null { return }
+    each_update(a.crumbs, crumbs(a.root_path, a.root_name, a.current))
+}
+
+shown_total(a: *App) -> long {
+    if string.equals(a.current, PURGEABLE_PATH) == 1 {
+        caches = cache_rows(a.root, a.os, a.home)
+        long t = 0
+        i = 0
+        while i < list.size(caches) {
+            t = t + row_at(caches, i).size
+            i = i + 1
+        }
+        return t
+    }
+    n = current_node(a)
+    if n == null { return 0 }
+    return n.size
+}
+
+refresh_status(a: *App) {
+    if a.status == 0 { return }
+    if a.subtitle != 0 {
+        long t = shown_total(a)
+        sub = ""
+        if t > 0 { sub = od_fmt.file_size(t) }
+        _s = set_text(a.subtitle, sub)
+    }
+    if a.scanning == 1 {
+        el = a.now - a.scan_t0
+        _t = set_text(a.status, od_view.status_scanning(a.scan.bytes, a.scan.items, el))
+        if a.progress != 0 {
+            if a.used_total > 0 {
+                f = (a.scan.bytes as float) / (a.used_total as float)
+                if f > 1.0 { f = 1.0 }
+                _p = set_progress(a.progress, f)
+                _h = set_hidden(a.progress, 0)
+            } else {
+                _h2 = set_hidden(a.progress, 1)
+            }
+        }
+    } else {
+        if a.progress != 0 { _h3 = set_hidden(a.progress, 1) }
+        msg = ""
+        if a.scan_secs > 0.0 { msg = od_fmt.scan_duration(a.scan_secs) }
+        if a.scan != null {
+            if a.scan.unreadable > 0 {
+                if a.root != null {
+                    if list.size(a.root.children) == 0 {
+                        msg = "Couldn't Read This Location"
+                    }
+                }
+            }
+        }
+        _t2 = set_text(a.status, msg)
+    }
+    if a.capacity != 0 {
+        cap = ""
+        if a.cap_total > 0 { cap = od_view.capacity_text(a.cap_avail, a.cap_total) }
+        _c = set_text(a.capacity, cap)
+    }
+    if a.total_lbl != 0 {
+        _l = set_text(a.total_lbl, od_view.status_idle_total(shown_total(a), list.size(a.rows)))
+    }
+}
+
+refresh_collector(a: *App) {
+    c = a.col
+    if a.col_items != null { each_update(a.col_items, c.items) }
+    n = od_collector.count(c)
+    if od_collector.deleting(c) == 1 {
+        cur = od_collector.del_current(c)
+        title = "Deleting…"
+        if string.length(cur) > 0 { title = "Deleting ${cur}…" }
+        _t = set_text(a.col_title, title)
+        _s = set_text(a.col_sub, "Freed ${od_fmt.file_size(od_collector.del_freed(c))} · ${od_collector.del_done(c)} of ${od_collector.del_total(c)}")
+        tot = od_collector.del_total(c)
+        f = 0.0
+        if tot > 0 { f = (od_collector.del_done(c) as float) / (tot as float) }
+        _p = set_progress(a.col_progress, f)
+        _h = set_hidden(a.col_progress, 0)
+        aether_ui_set_enabled(a.col_delete, 0)
+    } else if a.del_done_t > 0.0 {
+        msg = "Freed ${od_fmt.file_size(od_collector.del_freed(c))}"
+        nf = strarr.size(od_collector.del_failures(c))
+        if nf > 0 { msg = string.concat(msg, " · ${nf} couldn't be removed") }
+        _t2 = set_text(a.col_title, msg)
+        _s2 = set_text(a.col_sub, "")
+        _h2 = set_hidden(a.col_progress, 1)
+        aether_ui_set_enabled(a.col_delete, 0)
+    } else if n == 0 {
+        _t3 = set_text(a.col_title, "Drag files here to collect them for deletion")
+        _s3 = set_text(a.col_sub, "")
+        _h3 = set_hidden(a.col_progress, 1)
+        aether_ui_set_enabled(a.col_delete, 0)
+    } else {
+        what = "items"
+        if n == 1 { what = "item" }
+        _t4 = set_text(a.col_title, od_fmt.file_size(od_collector.total_bytes(c)))
+        _s4 = set_text(a.col_sub, "${n} ${what} collected")
+        _h4 = set_hidden(a.col_progress, 1)
+        aether_ui_set_enabled(a.col_delete, 1)
+    }
+    if a.col_notice != 0 {
+        _nt = set_text(a.col_notice, c.notice)
+        _nh = set_hidden(a.col_notice, string.length(c.notice) == 0)
+    }
+}

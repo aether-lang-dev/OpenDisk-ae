@@ -1,0 +1,123 @@
+// OpenDisk scanner (port of TraversalScannerTests), on real temporary files.
+import std.spec
+import std.list
+import std.string
+import std.fs
+import std.os
+import od_tree
+import od_tree (Node, node_for_path, child_count, count_nodes)
+import od_scan
+import od_scan (Scan, scan_new, scan_step, scan_run, scan_cancel)
+
+fresh_dir(tag: string) -> string {
+    p, err = fs.make_temp_dir(os.temp_dir(), string.concat("odscan-", tag))
+    return p
+}
+
+// n bytes of content (doubling, then trimming).
+bytes(n: int) -> string {
+    s = "x"
+    while string.length(s) < n { s = string.concat(s, s) }
+    return string.substring(s, 0, n)
+}
+
+mk(dir: string, name: string, n: int) -> string {
+    p = string.concat(dir, string.concat("/", name))
+    _w = fs.write(p, bytes(n))
+    return p
+}
+
+windows() -> int {
+    o = os_getenv("OS")
+    if o == null { return 0 }
+    return string.equals(o, "Windows_NT")
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "a scan") {
+        spec.it("sizes files by the space they take and rolls folders up") callback {
+            d = fresh_dir("sizes")
+            _a = mk(d, "a.bin", 4096)
+            _m = fs.create_dir(string.concat(d, "/sub"))
+            _b = mk(string.concat(d, "/sub"), "b.bin", 8192)
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_true(s.root.size >= 12288, "root ≥ 12288")
+            sub = node_for_path(s.root, string.concat(d, "/sub"))
+            spec.assert_not_null(sub as ptr, "sub found")
+            spec.assert_true(sub.size >= 8192, "sub ≥ 8192")
+            spec.assert_eq(child_count(sub), 1, "one child in sub")
+            spec.assert_eq(s.items, 3, "a.bin, sub, b.bin")
+            spec.assert_eq(s.unreadable, 0, "nothing unreadable")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("counts a hard-linked file once") callback {
+            if windows() == 1 { return }
+            d = fresh_dir("hardlink")
+            a = mk(d, "a.bin", 4096)
+            e = fs.hard_link(a, string.concat(d, "/b.bin"))
+            spec.assert_str_eq(e, "", "link made")
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_eq(child_count(s.root), 2, "two names")
+            spec.assert_true(s.root.size <= 8193, "counted once, not twice")
+            spec.assert_true(s.root.size >= 4096, "but counted")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("does not follow a symlink to a folder") callback {
+            if windows() == 1 { return }
+            d = fresh_dir("symlink")
+            big = fresh_dir("symlink-target")
+            _b = mk(big, "big.bin", 65536)
+            e = fs.symlink(big, string.concat(d, "/link"))
+            spec.assert_str_eq(e, "", "symlink made")
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_eq(count_nodes(s.root), 2, "root + the link itself")
+            spec.assert_true(s.root.size < 65536, "the target's bytes are not counted")
+            _r = fs.remove_tree(d)
+            _r2 = fs.remove_tree(big)
+        }
+        spec.it("grows the same tree step by step as it does all at once") callback {
+            d = fresh_dir("partial")
+            i = 0
+            while i < 5 {
+                sub = string.concat(d, "/d${i}")
+                _m = fs.create_dir(sub)
+                _f = mk(sub, "f.bin", 1000 + i)
+                i = i + 1
+            }
+            whole = scan_new(d, "root")
+            scan_run(whole)
+            stepped = scan_new(d, "root")
+            steps = 0
+            while scan_step(stepped, 1) == 1 {
+                steps = steps + 1
+                // a partial tree is always a consistent, rolled-up prefix
+                spec.assert_true(od_tree.roll_up(stepped.root) <= whole.root.size, "partial ≤ final")
+            }
+            spec.assert_true(steps >= 5, "it really did step")
+            spec.assert_eq(count_nodes(stepped.root), count_nodes(whole.root), "same node count")
+            spec.assert_eq_long(stepped.root.size, whole.root.size, "same size")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("returns just the root when cancelled before it starts") callback {
+            d = fresh_dir("cancel")
+            _a = mk(d, "a.bin", 10)
+            s = scan_new(d, "root")
+            scan_cancel(s)
+            spec.assert_eq(scan_step(s, 100), 0, "nothing more to do")
+            spec.assert_eq(count_nodes(s.root), 1, "root only")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("counts a folder it cannot open as unreadable") callback {
+            s = scan_new("/definitely/not/a/real/path/opendisk", "x")
+            scan_run(s)
+            spec.assert_eq(s.unreadable, 1, "unreadable")
+            spec.assert_eq(count_nodes(s.root), 1, "root only")
+        }
+    }
+    return spec.run_summary(fw)
+}

@@ -1,0 +1,290 @@
+// od_collector.ae — the Collector: things you mean to delete, gathered
+// first, deleted together.
+//
+// Port of OpenDisk's Collector (MIT, © 137137137):
+//   - add refuses silently: a synthetic "::" path, a path not on disk, an
+//     exact duplicate. A PROTECTED path is refused with a notice
+//     ("“name” is your home folder and can't be deleted").
+//   - an item inside an already-collected folder is ignored; collecting a
+//     folder drops any collected items inside it.
+//   - every change that actually changes the items is one undo step (a
+//     batch add is ONE step); no-ops push nothing. At most UNDO_LIMIT steps.
+//   - deletion is PERMANENT (no Trash — OpenDisk's own choice), one item at a
+//     time so a UI can show progress. Items that fail stay collected; the
+//     undo history is cleared afterwards.
+//   - totals are the sizes recorded when collected (nothing is re-measured).
+
+exports (
+    Collector, Item, collector_new, add, add_batch, remove, clear, undo, can_undo,
+    count, total_bytes, contains, item_at, set_rules, notice,
+    delete_begin, delete_step, delete_all, deleting, del_done, del_total, del_freed,
+    del_failures, del_current, del_deleted, item_new, UNDO_LIMIT
+)
+
+import std.string
+import std.list
+import std.strarr
+import std.fs
+import od_protected
+import od_tree
+
+extern malloc(size: int) -> ptr
+
+const UNDO_LIMIT: int = 50
+
+struct Item {
+    path: string,
+    name: string,
+    size: long,
+    is_dir: int
+}
+
+struct Collector {
+    items: ptr,
+    undo_stack: ptr,
+    notice: string,
+    // which rule set protects paths, and whose home (tests pin these)
+    os: string,
+    home: string,
+    // deletion in progress (delete_begin .. delete_step returns 0)
+    del_queue: ptr,
+    del_index: int,
+    del_active: int,
+    long del_freed_bytes,
+    del_deleted_count: int,
+    del_fail: ptr,          // std.strarr of failed paths
+    del_name: string
+}
+
+item_new(path: string, size: long, is_dir: int) -> *Item {
+    it = malloc(sizeof(Item)) as *Item
+    it.path = path
+    it.name = od_tree.last_component(path)
+    it.size = size
+    it.is_dir = is_dir
+    return it
+}
+
+collector_new() -> *Collector {
+    c = malloc(sizeof(Collector)) as *Collector
+    c.items = list.new()
+    c.undo_stack = list.new()
+    c.notice = ""
+    c.os = od_protected.host_os()
+    c.home = od_protected.home_dir()
+    c.del_queue = list.new()
+    c.del_index = 0
+    c.del_active = 0
+    c.del_freed_bytes = 0
+    c.del_deleted_count = 0
+    c.del_fail = strarr.new()
+    c.del_name = ""
+    return c
+}
+
+set_rules(c: *Collector, os: string, home: string) {
+    c.os = os
+    c.home = home
+}
+
+notice(c: *Collector) -> string { return c.notice }
+count(c: *Collector) -> int { return list.size(c.items) }
+item_at(c: *Collector, i: int) -> *Item { return list.list_get_raw(c.items, i) as *Item }
+
+total_bytes(c: *Collector) -> long {
+    long t = 0
+    n = list.size(c.items)
+    i = 0
+    while i < n {
+        t = t + item_at(c, i).size
+        i = i + 1
+    }
+    return t
+}
+
+contains(c: *Collector, path: string) -> int {
+    n = list.size(c.items)
+    i = 0
+    while i < n {
+        if string.equals(item_at(c, i).path, path) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+copy_items(l: ptr) -> ptr {
+    out = list.new()
+    n = list.size(l)
+    i = 0
+    while i < n {
+        _ = list.add(out, list.list_get_raw(l, i))
+        i = i + 1
+    }
+    return out
+}
+
+push_undo(c: *Collector) {
+    _ = list.add(c.undo_stack, copy_items(c.items))
+    while list.size(c.undo_stack) > UNDO_LIMIT {
+        list.list_remove(c.undo_stack, 0)
+    }
+}
+
+// Apply one add to `items` (no undo bookkeeping). 1 when it changed them.
+append_one(c: *Collector, it: *Item) -> int {
+    if string.starts_with(it.path, "::") == 1 { return 0 }
+    if fs.exists(it.path) == 0 { return 0 }
+    if contains(c, it.path) == 1 { return 0 }
+    why = od_protected.reason(it.path, c.os, c.home)
+    if string.length(why) > 0 {
+        c.notice = string.concat("“", string.concat(it.name, string.concat("” ", why)))
+        return 0
+    }
+    // Inside a collected folder already: nothing to add.
+    n = list.size(c.items)
+    i = 0
+    while i < n {
+        have = item_at(c, i)
+        if have.is_dir == 1 {
+            if od_tree.is_ancestor_path(have.path, it.path) == 1 { return 0 }
+        }
+        i = i + 1
+    }
+    // A folder absorbs anything collected inside it.
+    if it.is_dir == 1 {
+        j = list.size(c.items) - 1
+        while j >= 0 {
+            if od_tree.is_ancestor_path(it.path, item_at(c, j).path) == 1 {
+                list.list_remove(c.items, j)
+            }
+            j = j - 1
+        }
+    }
+    _ = list.add(c.items, it as ptr)
+    return 1
+}
+
+// Add several items as ONE undo step. Returns how many were added.
+add_batch(c: *Collector, items: ptr) -> int {
+    before = copy_items(c.items)
+    added = 0
+    n = list.size(items)
+    i = 0
+    while i < n {
+        added = added + append_one(c, list.list_get_raw(items, i) as *Item)
+        i = i + 1
+    }
+    if added > 0 {
+        _ = list.add(c.undo_stack, before)
+        while list.size(c.undo_stack) > UNDO_LIMIT {
+            list.list_remove(c.undo_stack, 0)
+        }
+    }
+    return added
+}
+
+add(c: *Collector, it: *Item) -> int {
+    one = list.new()
+    _ = list.add(one, it as ptr)
+    return add_batch(c, one)
+}
+
+remove(c: *Collector, path: string) -> int {
+    n = list.size(c.items)
+    i = 0
+    while i < n {
+        if string.equals(item_at(c, i).path, path) == 1 {
+            push_undo(c)
+            list.list_remove(c.items, i)
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+clear(c: *Collector) {
+    if list.size(c.items) == 0 { return }
+    push_undo(c)
+    c.items = list.new()
+}
+
+can_undo(c: *Collector) -> int {
+    if list.size(c.undo_stack) > 0 { return 1 }
+    return 0
+}
+
+undo(c: *Collector) -> int {
+    n = list.size(c.undo_stack)
+    if n == 0 { return 0 }
+    c.items = list.list_get_raw(c.undo_stack, n - 1)
+    list.list_remove(c.undo_stack, n - 1)
+    return 1
+}
+
+// ─── Deletion ─────────────────────────────────────────────────────
+
+deleting(c: *Collector) -> int { return c.del_active }
+del_done(c: *Collector) -> int { return c.del_index }
+del_total(c: *Collector) -> int { return list.size(c.del_queue) }
+del_freed(c: *Collector) -> long { return c.del_freed_bytes }
+del_deleted(c: *Collector) -> int { return c.del_deleted_count }
+del_failures(c: *Collector) -> ptr { return c.del_fail }
+del_current(c: *Collector) -> string { return c.del_name }
+
+delete_begin(c: *Collector) {
+    c.del_queue = copy_items(c.items)
+    c.del_index = 0
+    c.del_active = 1
+    c.del_freed_bytes = 0
+    c.del_deleted_count = 0
+    c.del_fail = strarr.new()
+    c.del_name = ""
+}
+
+// Delete the next item. Returns 1 while more remain, 0 when finished
+// (the Collector then holds only the failures, and has no undo history).
+delete_step(c: *Collector) -> int {
+    if c.del_active == 0 { return 0 }
+    n = list.size(c.del_queue)
+    if c.del_index < n {
+        it = list.list_get_raw(c.del_queue, c.del_index) as *Item
+        c.del_name = it.name
+        // Already gone is a failure, not a success: those bytes were not
+        // freed by us (OpenDisk's removeItem reports it the same way).
+        err = "no longer exists"
+        if fs.exists(it.path) == 1 { err = fs.remove_tree(it.path) }
+        if string.length(err) == 0 {
+            if fs.exists(it.path) == 1 { err = "could not be removed" }
+        }
+        if string.length(err) == 0 {
+            c.del_freed_bytes = c.del_freed_bytes + it.size
+            c.del_deleted_count = c.del_deleted_count + 1
+            // drop it from the collected items
+            m = list.size(c.items)
+            j = 0
+            while j < m {
+                if item_at(c, j) == it {
+                    list.list_remove(c.items, j)
+                    j = m
+                }
+                j = j + 1
+            }
+        } else {
+            _ = strarr.push_copy(c.del_fail, it.path)
+        }
+        c.del_index = c.del_index + 1
+        if c.del_index < n { return 1 }
+    }
+    c.del_active = 0
+    c.del_name = ""
+    c.undo_stack = list.new()
+    return 0
+}
+
+// Delete everything collected, synchronously. Returns bytes freed.
+delete_all(c: *Collector) -> long {
+    delete_begin(c)
+    while delete_step(c) == 1 { }
+    return c.del_freed_bytes
+}

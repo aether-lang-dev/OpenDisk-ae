@@ -1,0 +1,293 @@
+// od_chart.ae — the rings (sunburst) chart: which items show, where they
+// sit, what colour they are, and what is under the pointer. Pure — the
+// drawing is in opendisk.ae — so all of it is testable without a window.
+//
+// Port of OpenDisk's ChartItem + RingsChartLayout + ChartPalette (MIT,
+// © 137137137), same constants:
+//   MAX_DEPTH 5 (6 rings: a centre disc + 5 annuli), MIN_VISIBLE_FRACTION
+//   0.0015 of the root (children are taken largest-first and the walk STOPS
+//   at the first one below it — the rest of the arc stays empty, there is no
+//   "other" bucket), ITEM_MIN_ANGLE 0.03 rad (a thinner item is skipped with
+//   its descendants), PADDING 10.
+// Angles are radians from +x, increasing clockwise on screen (y down).
+
+exports (
+    Seg, Chart, chart_build, chart_build_list, chart_layout, chart_hit, seg_at,
+    seg_count, palette_rgb, color_position, seg_contains,
+    MAX_DEPTH, MIN_VISIBLE_FRACTION, ITEM_MIN_ANGLE, PADDING, TWO_PI
+)
+
+import std.math
+import std.list
+import std.string
+import od_tree
+import od_tree (Node, child_at, sorted_for_display)
+
+extern malloc(size: int) -> ptr
+extern atan2(y: float, x: float) -> float
+extern sqrt(x: float) -> float
+
+const MAX_DEPTH: int = 5
+const MIN_VISIBLE_FRACTION: float = 0.0015
+const ITEM_MIN_ANGLE: float = 0.03
+const PADDING: float = 10.0
+const TWO_PI: float = 6.283185307179586
+
+struct Seg {
+    node: *Node,
+    name: string,
+    path: string,
+    size: long,
+    is_dir: int,
+    depth: int,
+    // share of the parent in percent (0..100), and where it starts in it
+    rel_start: float,
+    rel_size: float,
+    fraction: float,        // of the chart root
+    hidden_children: int,   // a directory at MAX_DEPTH with children
+    // layout (chart_layout fills these)
+    start: float,
+    sweep: float,
+    inner: float,
+    outer: float
+}
+
+struct Chart {
+    name: string,
+    size: long,
+    segs: ptr,      // pre-order, root (depth 0) first
+    cx: float,
+    cy: float,
+    thickness: float,
+    w: float,
+    h: float
+}
+
+new_seg(n: *Node, name: string, depth: int) -> *Seg {
+    s = malloc(sizeof(Seg)) as *Seg
+    s.node = n
+    s.name = name
+    s.path = ""
+    s.size = 0
+    s.is_dir = 1
+    if n != null {
+        s.path = n.path
+        s.size = n.size
+        s.is_dir = n.is_dir
+    }
+    s.depth = depth
+    s.rel_start = 0.0
+    s.rel_size = 100.0
+    s.fraction = 1.0
+    s.hidden_children = 0
+    s.start = 0.0
+    s.sweep = TWO_PI
+    s.inner = 0.0
+    s.outer = 0.0
+    return s
+}
+
+to_f(v: long) -> float { return v as float }
+
+// Children of `parent_seg` from `kids` (already in display order), recursing.
+add_children(c: *Chart, parent_seg: *Seg, kids: ptr, depth: int) {
+    n = list.size(kids)
+    long psize = parent_seg.size
+    if psize < 1 { psize = 1 }
+    cursor = 0.0
+    i = 0
+    while i < n {
+        k = list.list_get_raw(kids, i) as *Node
+        if k.size <= 0 { break }
+        share = to_f(k.size) / to_f(psize) * 100.0
+        frac = parent_seg.fraction * share / 100.0
+        if frac < MIN_VISIBLE_FRACTION { break }
+        s = new_seg(k, k.name, depth)
+        s.rel_start = cursor
+        s.rel_size = share
+        s.fraction = frac
+        cursor = cursor + share
+        _ = list.add(c.segs, s as ptr)
+        if k.is_dir == 1 {
+            if depth >= MAX_DEPTH {
+                if list.size(k.children) > 0 { s.hidden_children = 1 }
+            } else {
+                add_children(c, s, sorted_for_display(k), depth + 1)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// The chart for directory `root` (null when it is not a directory).
+chart_build(root: *Node, name: string) -> *Chart {
+    if root == null { return null as *Chart }
+    if root.is_dir == 0 { return null as *Chart }
+    return chart_build_list(name, root, root.size, sorted_for_display(root))
+}
+
+// A chart whose root is `name`/`size` with the given children — how the
+// synthetic "Purgeable Space" root is drawn. `root` may be null.
+chart_build_list(name: string, root: *Node, size: long, kids: ptr) -> *Chart {
+    c = malloc(sizeof(Chart)) as *Chart
+    c.name = name
+    c.size = size
+    c.segs = list.new()
+    c.cx = 0.0
+    c.cy = 0.0
+    c.thickness = 0.0
+    c.w = 0.0
+    c.h = 0.0
+    rs = new_seg(root, name, 0)
+    rs.size = size
+    rs.is_dir = 1
+    _ = list.add(c.segs, rs as ptr)
+    add_children(c, rs, kids, 1)
+    return c
+}
+
+seg_count(c: *Chart) -> int { return list.size(c.segs) }
+seg_at(c: *Chart, i: int) -> *Seg { return list.list_get_raw(c.segs, i) as *Seg }
+
+// Place every segment in a w×h area. Segments thinner than ITEM_MIN_ANGLE
+// (and everything under them) get sweep 0 — drawn by nobody, hit by nothing.
+chart_layout(c: *Chart, w: float, h: float) {
+    c.w = w
+    c.h = h
+    c.cx = w / 2.0
+    c.cy = h / 2.0
+    maxr = math.min_float(w, h) / 2.0 - PADDING
+    if maxr < 1.0 { maxr = 1.0 }
+    c.thickness = maxr / to_f(MAX_DEPTH + 1)
+    // Pre-order walk with a parent stack: each depth-d seg's parent is the
+    // most recent seg at depth d-1.
+    stack = list.new()
+    n = list.size(c.segs)
+    i = 0
+    while i < n {
+        s = seg_at(c, i)
+        s.inner = to_f(s.depth) * c.thickness
+        s.outer = s.inner + c.thickness
+        if s.depth == 0 {
+            s.start = 0.0
+            s.sweep = TWO_PI
+            s.inner = 0.0
+            list.list_clear(stack)
+            _ = list.add(stack, s as ptr)
+        } else {
+            while list.size(stack) > s.depth {
+                list.list_remove(stack, list.size(stack) - 1)
+            }
+            p = list.list_get_raw(stack, list.size(stack) - 1) as *Seg
+            s.start = p.start + p.sweep * s.rel_start / 100.0
+            s.sweep = p.sweep * s.rel_size / 100.0
+            if p.sweep <= 0.0 { s.sweep = 0.0 }
+            if s.sweep < ITEM_MIN_ANGLE { s.sweep = 0.0 }
+            _ = list.add(stack, s as ptr)
+        }
+        i = i + 1
+    }
+}
+
+norm_angle(a: float) -> float {
+    r = a
+    while r < 0.0 { r = r + TWO_PI }
+    while r >= TWO_PI { r = r - TWO_PI }
+    return r
+}
+
+seg_contains(c: *Chart, s: *Seg, x: float, y: float) -> int {
+    dx = x - c.cx
+    dy = y - c.cy
+    r = sqrt(dx * dx + dy * dy)
+    if s.depth == 0 {
+        if r <= s.outer { return 1 }
+        return 0
+    }
+    if s.sweep <= 0.0 { return 0 }
+    if r <= s.inner { return 0 }
+    if r > s.outer { return 0 }
+    a = norm_angle(atan2(dy, dx))
+    if a >= s.start {
+        if a < s.start + s.sweep { return 1 }
+    }
+    return 0
+}
+
+// The segment under (x, y): the centre disc, else the first ring segment
+// whose annulus and angle contain it; null outside the chart.
+chart_hit(c: *Chart, x: float, y: float) -> *Seg {
+    if c == null { return null as *Seg }
+    n = list.size(c.segs)
+    if n == 0 { return null as *Seg }
+    root = seg_at(c, 0)
+    if seg_contains(c, root, x, y) == 1 { return root }
+    i = 1
+    while i < n {
+        s = seg_at(c, i)
+        if seg_contains(c, s, x, y) == 1 { return s }
+        i = i + 1
+    }
+    return null as *Seg
+}
+
+// ─── Palette ──────────────────────────────────────────────────────
+
+// Where on the colour wheel a segment sits: its bisector, 0..200.
+color_position(s: *Seg) -> float {
+    return (s.start + s.sweep / 2.0) / TWO_PI * 200.0
+}
+
+hue_chan(band: int, ch: int) -> float {
+    // #E01B24 #FF7800 #F6D32D #33D17A #3584E4 #9141AC
+    b = band % 6
+    v = 0
+    if b == 0 { if ch == 0 { v = 224 } else if ch == 1 { v = 27 } else { v = 36 } }
+    if b == 1 { if ch == 0 { v = 255 } else if ch == 1 { v = 120 } else { v = 0 } }
+    if b == 2 { if ch == 0 { v = 246 } else if ch == 1 { v = 211 } else { v = 45 } }
+    if b == 3 { if ch == 0 { v = 51 } else if ch == 1 { v = 209 } else { v = 122 } }
+    if b == 4 { if ch == 0 { v = 53 } else if ch == 1 { v = 132 } else { v = 228 } }
+    if b == 5 { if ch == 0 { v = 145 } else if ch == 1 { v = 65 } else { v = 172 } }
+    return (v as float) / 255.0
+}
+
+// One channel (0 r, 1 g, 2 b) of the fill for a segment at `position`
+// (0..200) and `depth`, highlighted or not. Depth 0 is the grey centre.
+palette_rgb(position: float, depth: int, highlighted: int, ch: int) -> float {
+    if depth == 0 {
+        // #D3D6D1, highlighted #E0E2DD
+        if highlighted == 1 {
+            if ch == 0 { return 224.0 / 255.0 }
+            if ch == 1 { return 226.0 / 255.0 }
+            return 221.0 / 255.0
+        }
+        if ch == 0 { return 211.0 / 255.0 }
+        if ch == 1 { return 214.0 / 255.0 }
+        return 209.0 / 255.0
+    }
+    p = position
+    if p != p { p = 0.0 }          // NaN
+    if p < 0.0 { p = 0.0 }
+    if p > 199.999 { p = 199.999 }
+    bw = 100.0 / 3.0
+    band = math.floor(p / bw) as int
+    t = (p - (band as float) * bw) / bw
+    intensity = 1.0 - ((depth - 1) as float) * 0.3 / 5.0
+    rgb0 = mix(band, 0, t) * intensity
+    rgb1 = mix(band, 1, t) * intensity
+    rgb2 = mix(band, 2, t) * intensity
+    v = rgb0
+    if ch == 1 { v = rgb1 }
+    if ch == 2 { v = rgb2 }
+    if highlighted == 1 {
+        mx = math.max_float(rgb0, math.max_float(rgb1, rgb2))
+        if mx > 0.0 { v = v / mx }
+    }
+    return v
+}
+
+mix(band: int, ch: int, t: float) -> float {
+    a = hue_chan(band, ch)
+    b = hue_chan(band + 1, ch)
+    return a + (b - a) * t
+}

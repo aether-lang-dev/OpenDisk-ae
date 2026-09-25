@@ -1,0 +1,162 @@
+// od_scan.ae — walk a folder or disk into an od_tree, a batch at a time.
+//
+// The portable core of OpenDisk's TraversalScanner (MIT, © 137137137):
+//   - a file's size is its ALLOCATED size; a file with more than one link
+//     is counted at its first sighting only (hard-link dedup)
+//   - symlinks are never followed (recorded as files, usually 0 bytes)
+//   - the walk stays on the root's device: a subfolder on another device (a
+//     mount point) becomes an EMPTY folder node and is not descended; that
+//     is not "unreadable"
+//   - a folder that can't be opened is counted in `unreadable`
+//   - items = files + folders seen (the root not included)
+// It is a work queue drained from the app's frame tick (scan_step), so the
+// window stays live and the tree grows while it scans; scan_run drains it
+// in one go (tests, CLI). macOS-only accelerations (getattrlistbulk,
+// FSEvents incremental rescans) are not ported: every scan is a full scan.
+
+exports (Scan, scan_new, scan_step, scan_run, scan_cancel, scan_done, join_path)
+
+import std.string
+import std.list
+import std.dir
+import od_stat
+import od_tree
+import od_tree (Node, node_new, node_add, LinkSet, links_new, link_claim)
+
+extern malloc(size: int) -> ptr
+
+struct Scan {
+    root: *Node,
+    pending: ptr,
+    dev: long,
+    links: *LinkSet,
+    items: int,
+    long bytes,
+    unreadable: int,
+    finished: int,
+    cancelled: int
+}
+
+join_path(dir: string, name: string) -> string {
+    if string.ends_with(dir, "/") == 1 { return string.concat(dir, name) }
+    if string.ends_with(dir, "\\") == 1 { return string.concat(dir, name) }
+    return string.concat(dir, string.concat("/", name))
+}
+
+// Start a scan of `path`, shown as `name`. Nothing is read until scan_step.
+scan_new(path: string, name: string) -> *Scan {
+    s = malloc(sizeof(Scan)) as *Scan
+    s.pending = list.new()
+    s.links = links_new()
+    s.items = 0
+    s.bytes = 0
+    s.unreadable = 0
+    s.finished = 0
+    s.cancelled = 0
+    s.dev = 0
+    is_dir = 1
+    long size = 0
+    if od_stat.stat_try(path) == 1 {
+        s.dev = od_stat.stat_dev()
+        if od_stat.stat_kind() != od_stat.KIND_DIR {
+            is_dir = 0
+            size = od_stat.stat_alloc()
+        }
+    } else {
+        s.unreadable = 1
+    }
+    s.root = node_new(name, path, is_dir, size)
+    if is_dir == 1 {
+        if s.unreadable == 0 { _ = list.add(s.pending, s.root as ptr) }
+    }
+    if list.size(s.pending) == 0 { s.finished = 1 }
+    return s
+}
+
+// Read one folder: files get their sizes now, subfolders are queued.
+read_dir(s: *Scan, d: *Node) {
+    entries, lerr = dir.list(d.path)
+    if string.length(lerr) > 0 {
+        s.unreadable = s.unreadable + 1
+        return
+    }
+    n = dir.list_count(entries)
+    i = 0
+    while i < n {
+        // list_get is a borrowed pointer into the listing: take a copy.
+        nm = string.concat(dir.list_get(entries, i), "")
+        if string.equals(nm, ".") == 0 {
+            if string.equals(nm, "..") == 0 { add_entry(s, d, nm) }
+        }
+        i = i + 1
+    }
+}
+
+add_entry(s: *Scan, d: *Node, nm: string) {
+    p = join_path(d.path, nm)
+    if od_stat.stat_try(p) == 0 { return }     // vanished mid-scan
+    kind = od_stat.stat_kind()
+    if kind == od_stat.KIND_DIR {
+        c = node_new(nm, p, 1, 0)
+        node_add(d, c)
+        s.items = s.items + 1
+        // Another device below us: a mount point. Keep it, empty.
+        if od_stat.stat_dev() == s.dev { _ = list.add(s.pending, c as ptr) }
+        return
+    }
+    long sz = od_stat.stat_alloc()
+    if sz < 0 { sz = 0 }
+    if sz > 1000000000000000000 { sz = 0 }
+    if od_stat.stat_nlink() > 1 {
+        long ino = od_stat.stat_ino()
+        if ino > 0 {
+            if link_claim(s.links, od_stat.stat_dev(), ino) == 0 { sz = 0 }
+        }
+    }
+    node_add(d, node_new(nm, p, 0, sz))
+    s.items = s.items + 1
+    s.bytes = s.bytes + sz
+}
+
+// Read up to `budget` folders. Returns 1 while there is more to do. The
+// queue pops from the end: depth-first, so the folder being looked at
+// fills in coherently.
+scan_step(s: *Scan, budget: int) -> int {
+    if s.finished == 1 { return 0 }
+    if s.cancelled == 1 {
+        s.finished = 1
+        return 0
+    }
+    k = 0
+    while k < budget {
+        np = list.size(s.pending)
+        if np == 0 { k = budget }
+        else {
+            d = list.list_get_raw(s.pending, np - 1) as *Node
+            list.list_remove(s.pending, np - 1)
+            read_dir(s, d)
+            k = k + 1
+        }
+    }
+    if list.size(s.pending) == 0 {
+        s.finished = 1
+        _ = od_tree.roll_up(s.root)
+        return 0
+    }
+    return 1
+}
+
+scan_run(s: *Scan) {
+    while scan_step(s, 256) == 1 { }
+    _ = od_tree.roll_up(s.root)
+}
+
+// Stop: whatever was read stays; nothing more is.
+scan_cancel(s: *Scan) {
+    s.cancelled = 1
+    s.pending = list.new()
+    s.finished = 1
+    _ = od_tree.roll_up(s.root)
+}
+
+scan_done(s: *Scan) -> int { return s.finished }

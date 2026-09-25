@@ -1,0 +1,65 @@
+// spec_chart.ae — OpenDisk's rings chart: hovering names a segment (its
+// accessibility description, "name, size, pct percent"), a folder ring
+// opens that folder, the centre goes back, the canvas really paints.
+import std.spec
+import std.string
+import std.math
+import od_driver
+import uidriver
+
+main() {
+    fw = spec.init()
+    od_driver.wait_for_app()
+
+    spec.describe(fw, "OpenDisk: rings chart") {
+        spec.it("paints the chart: grey centre, coloured rings, white around") callback {
+            spec.assert_true(od_driver.canvas_id() > 0, "a canvas")
+            spec.assert_eq(od_driver.chart_rgb(250.0, 250.0), 13883089, "centre is #D3D6D1")
+            spec.assert_eq(od_driver.chart_rgb(3.0, 3.0), 16777215, "corner is white")
+            a = od_driver.hover_segment("Movies", 1)
+            od_driver.hover_chart_vb(250.0, 250.0)
+            ring = od_driver.chart_rgb(250.0 + 60.0 * math.cos(a), 250.0 + 60.0 * math.sin(a))
+            spec.assert_true(ring != 16777215, "ring 1 is painted")
+            spec.assert_true(ring != 13883089, "in a colour, not the centre grey")
+        }
+        spec.it("names the largest folder on the first ring when hovered") callback {
+            a = od_driver.hover_segment("Movies", 1)
+            spec.assert_true(a >= 0.0, "Movies found on ring 1")
+            d = od_driver.chart_a11y()
+            spec.assert_contains(d, "Movies, ", "name")
+            spec.assert_contains(d, "MB", "size")
+            spec.assert_contains(d, "percent", "share")
+        }
+        spec.it("shows a file on the second ring inside its folder") callback {
+            a = od_driver.hover_segment("movie.mov", 2)
+            spec.assert_true(a >= 0.0, "movie.mov found on ring 2")
+        }
+        spec.it("describes the centre as the whole folder") callback {
+            od_driver.hover_chart_vb(250.0, 250.0)
+            d = od_driver.chart_a11y()
+            spec.assert_contains(d, string.concat(od_driver.fixture_name(), ", "), "centre is the root")
+            spec.assert_contains(d, "100.0 percent", "all of it")
+        }
+        spec.it("opens a folder when its ring is clicked") callback {
+            ok = od_driver.click_segment_named("Music", 1)
+            spec.assert_true(ok, "clicked Music")
+            want = string.concat(od_driver.fixture_name(), " > Music")
+            spec.assert_true(od_driver.wait_crumbs(want, 20), "crumbs root > Music")
+            spec.assert_str_eq(od_driver.list_names(), "song.flac", "Music's contents listed")
+        }
+        spec.it("goes back when the centre is clicked") callback {
+            od_driver.click_chart_centre()
+            spec.assert_true(od_driver.wait_crumbs(od_driver.fixture_name(), 20), "back at the root")
+        }
+        spec.it("does nothing when a file is clicked") callback {
+            ok = od_driver.click_segment_named("movie.mov", 2)
+            spec.assert_true(ok, "clicked movie.mov")
+            spec.assert_str_eq(od_driver.crumbs_line(), od_driver.fixture_name(), "still at the root")
+        }
+        spec.it("does not draw an item too thin to see (under 0.03 rad)") callback {
+            // tiny.txt is 4 KB of ~2.5 MB: 0.01 rad, below OpenDisk's minimum
+            spec.assert_true(od_driver.hover_segment("tiny.txt", 1) < 0.0, "never hovered")
+        }
+    }
+    return spec.run_summary(fw)
+}

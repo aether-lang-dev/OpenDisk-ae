@@ -1,0 +1,52 @@
+// spec_search.ae — OpenDisk search: typing in the search field lists
+// every match largest first with a summary; a result opens its folder and
+// closes the search; clearing the field brings the folder back.
+import std.spec
+import std.string
+import od_driver
+import uidriver
+
+search_field() -> int { return uidriver.widget_id_of("textfield", "") }
+
+type(q: string) {
+    uidriver.post_ok("/widget/${search_field()}/set_text?v=${q}", string.concat("type ", q))
+}
+
+main() {
+    fw = spec.init()
+    od_driver.wait_for_app()
+
+    spec.describe(fw, "OpenDisk: search") {
+        spec.it("has a search field with OpenDisk's prompt") callback {
+            spec.assert_true(search_field() > 0, "a textfield")
+            body = uidriver.get_body("/widget/${search_field()}")
+            spec.assert_contains(body, "Search scanned files and folders", "placeholder")
+        }
+        spec.it("finds every match, case-insensitively, largest first") callback {
+            type("REPORT")
+            spec.assert_true(od_driver.wait_text("matches · largest first", 20), "summary")
+            spec.assert_contains(od_driver.text_containing("matches"), "2 matches", "two")
+            spec.assert_str_eq(od_driver.list_names(), "report.pdf|report-old.pdf", "results")
+        }
+        spec.it("ANDs the words") callback {
+            type("report%20old")
+            spec.assert_true(od_driver.wait_text("1 match · largest first", 20), "one match")
+            spec.assert_str_eq(od_driver.list_names(), "report-old.pdf", "only the old one")
+        }
+        spec.it("opens a result's folder and closes the search") callback {
+            od_driver.click_row("report-old.pdf")
+            want = string.concat(od_driver.fixture_name(), " > Documents > drafts")
+            spec.assert_true(od_driver.wait_crumbs(want, 20), "in drafts")
+            spec.assert_str_eq(od_driver.list_names(), "report-old.pdf", "drafts listed")
+            spec.assert_str_eq(od_driver.text_containing("matches"), "", "summary gone")
+        }
+        spec.it("shows the folder again when the search is cleared") callback {
+            type("movie")
+            spec.assert_true(od_driver.wait_text("2 matches", 20), "Movies and movie.mov")
+            type("")
+            spec.assert_str_eq(od_driver.text_containing("match"), "", "no summary")
+            spec.assert_str_eq(od_driver.list_names(), "report-old.pdf", "the folder again")
+        }
+    }
+    return spec.run_summary(fw)
+}

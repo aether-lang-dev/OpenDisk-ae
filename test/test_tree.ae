@@ -1,0 +1,124 @@
+// OpenDisk file tree (port of FileTreeTests' roll-up / lookup / removal /
+// display-order cases; the serialization and merge cases are for OpenDisk's
+// macOS-only scan cache and firmlink merge, which the port does not have).
+import std.spec
+import std.list
+import std.string
+import od_tree
+import od_tree (Node, node_new, node_add, roll_up, node_for_path, child_count,
+    remove_child, sorted_for_display, is_ancestor_path, last_component, parent_path)
+
+dir(p: *Node, name: string) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 1, 0)
+    node_add(p, n)
+    return n
+}
+file(p: *Node, name: string, size: long) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 0, size)
+    node_add(p, n)
+    return n
+}
+
+// root{ Users{ alice{ big.bin 4096 }, shared.txt 50 }, top.txt 100 }:
+// root 4246, Users 4146, alice 4096 — the Swift fixture's numbers.
+sample() -> *Node {
+    root = node_new("/", "", 1, 0)
+    users = dir(root, "Users")
+    alice = dir(users, "alice")
+    _b = file(alice, "big.bin", 4096)
+    _s = file(users, "shared.txt", 50)
+    _t = file(root, "top.txt", 100)
+    return root
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "roll_up") {
+        spec.it("sums every folder from its children") callback {
+            root = sample()
+            _ = roll_up(root)
+            spec.assert_eq_long(root.size, 4246, "root")
+            spec.assert_eq_long(node_for_path(root, "/Users").size, 4146, "Users")
+            spec.assert_eq_long(node_for_path(root, "/Users/alice").size, 4096, "alice")
+        }
+    }
+
+    spec.describe(fw, "lookup") {
+        spec.it("resolves a path to its node, and misses cleanly") callback {
+            root = sample()
+            n = node_for_path(root, "/Users/alice/big.bin")
+            spec.assert_not_null(n as ptr, "found")
+            spec.assert_str_eq(n.path, "/Users/alice/big.bin", "path_of")
+            spec.assert_null(node_for_path(root, "/Users/nobody") as ptr, "nobody")
+        }
+        spec.it("counts direct children") callback {
+            root = sample()
+            spec.assert_eq(child_count(root), 2, "root")
+            spec.assert_eq(child_count(node_for_path(root, "/Users")), 2, "Users")
+        }
+    }
+
+    spec.describe(fw, "remove_child") {
+        spec.it("detaches a subtree and takes its bytes off every ancestor") callback {
+            root = sample()
+            _ = roll_up(root)
+            users = node_for_path(root, "/Users")
+            spec.assert_eq(remove_child(root, users), 1, "removed")
+            spec.assert_eq_long(root.size, 100, "root now just top.txt")
+            spec.assert_null(node_for_path(root, "/Users") as ptr, "gone")
+            spec.assert_eq(child_count(root), 1, "one child")
+            spec.assert_eq(users.detached, 1, "marked detached")
+        }
+    }
+
+    spec.describe(fw, "display order") {
+        spec.it("is size descending, ties by name") callback {
+            root = node_new("r", "/r", 1, 0)
+            _a = file(root, "b.bin", 10)
+            _b = file(root, "a.bin", 10)
+            _c = file(root, "big", 99)
+            l = sorted_for_display(root)
+            n0 = list.list_get_raw(l, 0) as *Node
+            n1 = list.list_get_raw(l, 1) as *Node
+            n2 = list.list_get_raw(l, 2) as *Node
+            spec.assert_str_eq(n0.name, "big", "largest first")
+            spec.assert_str_eq(n1.name, "a.bin", "tie: a before b")
+            spec.assert_str_eq(n2.name, "b.bin", "then b")
+        }
+        spec.it("sorts a large folder correctly (merge sort)") callback {
+            root = node_new("r", "/r", 1, 0)
+            i = 0
+            while i < 1000 {
+                long sz = ((i * 7919) % 1000) as long
+                _f = file(root, "f${i}", sz)
+                i = i + 1
+            }
+            l = sorted_for_display(root)
+            ok = 1
+            j = 1
+            while j < 1000 {
+                p = list.list_get_raw(l, j - 1) as *Node
+                q = list.list_get_raw(l, j) as *Node
+                if p.size < q.size { ok = 0 }
+                j = j + 1
+            }
+            spec.assert_true(ok, "non-increasing sizes")
+            spec.assert_eq(list.size(l), 1000, "nothing lost")
+        }
+    }
+
+    spec.describe(fw, "path helpers") {
+        spec.it("knows ancestors, last components and parents") callback {
+            spec.assert_true(is_ancestor_path("/a", "/a/b"), "/a of /a/b")
+            spec.assert_false(is_ancestor_path("/a", "/ab"), "/a not of /ab")
+            spec.assert_false(is_ancestor_path("/a", "/a"), "not of itself")
+            spec.assert_str_eq(last_component("/x/y/z.txt"), "z.txt", "last")
+            spec.assert_str_eq(last_component("/"), "/", "root")
+            spec.assert_str_eq(last_component("/x/y/"), "y", "trailing slash")
+            spec.assert_str_eq(parent_path("/x/y"), "/x", "parent")
+            spec.assert_str_eq(parent_path("/x"), "/", "parent of top")
+        }
+    }
+    return spec.run_summary(fw)
+}

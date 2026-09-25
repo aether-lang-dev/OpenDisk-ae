@@ -1,0 +1,184 @@
+// OpenDisk analysis-screen rules (port of DiskAnalyzerTests' view cases,
+// the Purgeable Space row, breadcrumbs and the screen's text).
+// Tree: /Volumes/Test{ Documents{ report.pdf 50,000 }, movie.mov 2,000,000, tiny.txt 10 }
+import std.spec
+import std.list
+import std.string
+import std.fs
+import std.os
+import od_tree
+import od_tree (Node, node_new, node_add, roll_up, node_for_path)
+import od_view
+import od_view (Row, Crumb, rows_for, row_at, sort_rows, purgeable_row, cache_rows,
+    crumbs, row_subline, status_scanning, status_idle_total, capacity_text,
+    search_summary, tip_detail, SORT_NAME, SORT_SIZE, PURGEABLE_PATH)
+import od_collector
+import od_collector (Collector, collector_new, set_rules, add, item_new)
+
+dir(p: *Node, name: string) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 1, 0)
+    node_add(p, n)
+    return n
+}
+file(p: *Node, name: string, size: long) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 0, size)
+    node_add(p, n)
+    return n
+}
+
+sample() -> *Node {
+    root = node_new("Test", "/Volumes/Test", 1, 0)
+    docs = dir(root, "Documents")
+    _r = file(docs, "report.pdf", 50000)
+    _m = file(root, "movie.mov", 2000000)
+    _t = file(root, "tiny.txt", 10)
+    _ = roll_up(root)
+    return root
+}
+
+names(l: ptr) -> string {
+    out = ""
+    i = 0
+    while i < list.size(l) {
+        if i > 0 { out = string.concat(out, "|") }
+        out = string.concat(out, row_at(l, i).name)
+        i = i + 1
+    }
+    return out
+}
+
+crumb_labels(l: ptr) -> string {
+    out = ""
+    i = 0
+    while i < list.size(l) {
+        c = list.list_get_raw(l, i) as *Crumb
+        if i > 0 { out = string.concat(out, " > ") }
+        out = string.concat(out, c.label)
+        i = i + 1
+    }
+    return out
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "the list") {
+        spec.it("lists the scan root largest first, hiding items under 1 KB") callback {
+            root = sample()
+            rows = rows_for(root, 1, 0, null as *Collector, "linux", "/home/x")
+            spec.assert_str_eq(names(rows), "movie.mov|Documents", "tiny.txt is hidden")
+            partial = rows_for(root, 1, 1, null as *Collector, "linux", "/home/x")
+            spec.assert_str_eq(names(partial), "movie.mov|Documents|tiny.txt", "all while scanning")
+            spec.assert_eq_long(row_at(rows, 0).size, 2000000, "movie size")
+            spec.assert_eq(row_at(rows, 1).item_count, 1, "Documents has 1 item")
+        }
+        spec.it("hides tiny items below the root once the scan is done") callback {
+            root = node_new("R", "/R", 1, 0)
+            sub = dir(root, "sub")
+            _a = file(sub, "movie.mov", 2000000)
+            _b = file(sub, "tiny.txt", 10)
+            _ = roll_up(root)
+            done = rows_for(sub, 0, 0, null as *Collector, "linux", "/home/x")
+            spec.assert_str_eq(names(done), "movie.mov", "tiny hidden")
+            partial = rows_for(sub, 0, 1, null as *Collector, "linux", "/home/x")
+            spec.assert_str_eq(names(partial), "movie.mov|tiny.txt", "all while scanning")
+        }
+        spec.it("caps a deep folder at the 100 largest") callback {
+            root = node_new("R", "/R", 1, 0)
+            sub = dir(root, "sub")
+            i = 0
+            while i < 150 {
+                _f = file(sub, "f${i}", (5000 + i) as long)
+                i = i + 1
+            }
+            _ = roll_up(root)
+            spec.assert_eq(list.size(rows_for(sub, 0, 0, null as *Collector, "linux", "/h")), 100, "100")
+            spec.assert_eq(list.size(rows_for(root, 1, 0, null as *Collector, "linux", "/h")), 1, "root: sub")
+        }
+        spec.it("leaves out what is already collected") callback {
+            d, _e = fs.make_temp_dir(os.temp_dir(), "odview")
+            root = node_new("R", d, 1, 0)
+            f = file(root, "keep.bin", 5000)
+            g = file(root, "gone.bin", 6000)
+            _w = fs.write(g.path, "x")
+            _ = roll_up(root)
+            col = collector_new()
+            set_rules(col, "linux", "/home/nobody-opendisk-tests")
+            _a = add(col, item_new(g.path, g.size, 0))
+            spec.assert_str_eq(names(rows_for(root, 1, 0, col, "linux", "/h")), "keep.bin", "collected hidden")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("sorts by name ascending or size descending") callback {
+            rows = rows_for(sample(), 1, 1, null as *Collector, "linux", "/home/x")
+            sort_rows(rows, SORT_NAME, 1)
+            spec.assert_str_eq(names(rows), "Documents|movie.mov|tiny.txt", "by name, any case")
+            sort_rows(rows, SORT_SIZE, 0)
+            spec.assert_str_eq(names(rows), "movie.mov|Documents|tiny.txt", "by size")
+            sort_rows(rows, SORT_SIZE, 1)
+            spec.assert_str_eq(names(rows), "tiny.txt|Documents|movie.mov", "size ascending")
+        }
+    }
+
+    spec.describe(fw, "Purgeable Space") {
+        spec.it("adds up the known cache folders found in the tree") callback {
+            root = node_new("home", "/home/alice", 1, 0)
+            cache = dir(root, ".cache")
+            pip = dir(cache, "pip")
+            _p = file(pip, "wheel.whl", 3000)
+            npm = dir(root, ".npm")
+            cc = dir(npm, "_cacache")
+            _n = file(cc, "blob", 7000)
+            _d = file(root, "doc.txt", 100)
+            _ = roll_up(root)
+            pr = purgeable_row(root, "linux", "/home/alice")
+            spec.assert_not_null(pr as ptr, "found")
+            spec.assert_str_eq(pr.path, PURGEABLE_PATH, "synthetic path")
+            spec.assert_eq_long(pr.size, 10000, "pip + npm")
+            spec.assert_eq(pr.item_count, 2, "two caches")
+            caches = cache_rows(root, "linux", "/home/alice")
+            spec.assert_str_eq(names(caches), "npm Cache|pip Cache", "named, largest first")
+            rows = rows_for(root, 1, 0, null as *Collector, "linux", "/home/alice")
+            spec.assert_contains(names(rows), "Purgeable Space", "listed at the root")
+        }
+        spec.it("is absent when there are no caches") callback {
+            spec.assert_null(purgeable_row(sample(), "linux", "/home/x") as ptr, "none")
+        }
+    }
+
+    spec.describe(fw, "breadcrumbs") {
+        spec.it("run from the root name down to the current folder") callback {
+            spec.assert_str_eq(crumb_labels(crumbs("/Volumes/T", "T", "/Volumes/T/a/b")), "T > a > b", "path")
+            spec.assert_str_eq(crumb_labels(crumbs("/Volumes/T", "T", "/Volumes/T")), "T", "root only")
+            spec.assert_str_eq(crumb_labels(crumbs("/", "Computer", "/usr/local")), "Computer > usr > local", "from /")
+            spec.assert_str_eq(crumb_labels(crumbs("/Volumes/T", "T", "::Purgeable Space")), "T > Purgeable Space", "synthetic")
+            l = crumbs("/", "Computer", "/usr/local")
+            last = list.list_get_raw(l, 2) as *Crumb
+            spec.assert_str_eq(last.path, "/usr/local", "crumb paths accumulate")
+        }
+    }
+
+    spec.describe(fw, "text") {
+        spec.it("says what the scan is doing") callback {
+            spec.assert_str_eq(status_scanning(0, 0, 0.0), "Scanning…", "nothing yet")
+            spec.assert_str_eq(status_scanning(1500000, 3456, 2.0),
+                "Scanning: 1.5 MB (3,456 items) · 1,728 files/sec", "progress")
+            spec.assert_str_eq(status_idle_total(2050000, 3), "2.1 MB · 3 items", "total")
+            spec.assert_str_eq(status_idle_total(2050000, 1), "2.1 MB · 1 item", "singular")
+            spec.assert_str_eq(capacity_text(120000000000, 500000000000), "120 GB available of 500 GB", "capacity")
+        }
+        spec.it("summarises search results") callback {
+            spec.assert_str_eq(search_summary(500, 1234, 0), "Largest 500 of 1,234 matches", "capped")
+            spec.assert_str_eq(search_summary(1, 1, 0), "1 match · largest first", "one")
+            spec.assert_str_eq(search_summary(12, 12, 1),
+                "12 matches · largest first · scan in progress, results may be incomplete", "partial")
+        }
+        spec.it("describes rows and hover tips") callback {
+            root = sample()
+            docs = od_view.row_of(node_for_path(root, "/Volumes/Test/Documents"))
+            spec.assert_str_eq(row_subline(docs, "", ""), "1 items", "folder count (no singular, as OpenDisk)")
+            spec.assert_str_eq(row_subline(docs, "/home/al/Docs", "/home/al"), "~/Docs", "location")
+            spec.assert_str_eq(tip_detail(1500000, 0.4), "1.5 MB · 40.0%", "tip")
+        }
+    }
+    return spec.run_summary(fw)
+}

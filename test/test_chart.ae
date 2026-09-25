@@ -1,0 +1,137 @@
+// OpenDisk rings chart (port of ChartModelTests: item selection, layout,
+// hit-testing, palette).
+// Tree: /Volumes/T (1000){ big{ a.bin 400, b.bin 200 }, small{ c.bin 300 }, file.dat 100 }
+import std.spec
+import std.list
+import std.string
+import std.math
+import od_tree
+import od_tree (Node, node_new, node_add, roll_up)
+import od_chart
+import od_chart (Seg, Chart, chart_build, chart_layout, chart_hit, seg_at, seg_count,
+    palette_rgb, TWO_PI)
+
+dir(p: *Node, name: string) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 1, 0)
+    node_add(p, n)
+    return n
+}
+file(p: *Node, name: string, size: long) -> *Node {
+    n = node_new(name, string.concat(p.path, string.concat("/", name)), 0, size)
+    node_add(p, n)
+    return n
+}
+
+sample() -> *Node {
+    root = node_new("T", "/Volumes/T", 1, 0)
+    big = dir(root, "big")
+    _a = file(big, "a.bin", 400)
+    _b = file(big, "b.bin", 200)
+    small = dir(root, "small")
+    _c = file(small, "c.bin", 300)
+    _f = file(root, "file.dat", 100)
+    _ = roll_up(root)
+    return root
+}
+
+find_seg(c: *Chart, name: string) -> *Seg {
+    n = seg_count(c)
+    i = 0
+    while i < n {
+        s = seg_at(c, i)
+        if string.equals(s.name, name) == 1 { return s }
+        i = i + 1
+    }
+    return null as *Seg
+}
+
+// Floats compared to 2 decimals.
+cents(v: float) -> int { return math.round(v * 100.0) as int }
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "which items the chart shows") {
+        spec.it("takes children largest first, with their share of the parent") callback {
+            c = chart_build(sample(), "T")
+            spec.assert_eq(seg_count(c), 7, "root + 3 + 3 grandchildren")
+            s1 = seg_at(c, 1)
+            spec.assert_str_eq(s1.name, "big", "largest first")
+            big = find_seg(c, "big")
+            spec.assert_eq(cents(big.rel_size), 6000, "big is 60%")
+            spec.assert_eq(cents(big.rel_start), 0, "big starts at 0")
+            small = find_seg(c, "small")
+            spec.assert_eq(cents(small.rel_size), 3000, "small is 30%")
+            spec.assert_eq(cents(small.rel_start), 6000, "small starts after big")
+        }
+        spec.it("nests a folder's children in its share, with paths") callback {
+            c = chart_build(sample(), "T")
+            a = find_seg(c, "a.bin")
+            spec.assert_eq(a.depth, 2, "depth 2")
+            spec.assert_eq(cents(a.rel_size), 6667, "a is 66.67% of big")
+            spec.assert_eq(cents(a.fraction), 40, "a is 0.4 of the root")
+            spec.assert_str_eq(a.path, "/Volumes/T/big/a.bin", "path")
+        }
+        spec.it("drops items too small to see") callback {
+            root = node_new("T", "/T", 1, 0)
+            _h = file(root, "huge", 1000000)
+            _d = file(root, "dust", 100)
+            _ = roll_up(root)
+            c = chart_build(root, "T")
+            spec.assert_eq(seg_count(c), 2, "root + huge only")
+            spec.assert_null(find_seg(c, "dust") as ptr, "dust dropped")
+        }
+        spec.it("has no chart for a file") callback {
+            f = node_new("x", "/x", 0, 10)
+            spec.assert_null(chart_build(f, "x") as ptr, "nil for a file")
+        }
+    }
+
+    spec.describe(fw, "layout in 400×400") {
+        spec.it("gives the root the full circle and each ring its thickness") callback {
+            c = chart_build(sample(), "T")
+            chart_layout(c, 400.0, 400.0)
+            root = seg_at(c, 0)
+            spec.assert_eq(cents(root.sweep), cents(TWO_PI), "full circle")
+            big = find_seg(c, "big")
+            spec.assert_eq(cents(big.sweep), cents(0.6 * TWO_PI), "60% of the circle")
+            spec.assert_eq(cents(big.inner), cents(c.thickness), "ring 1 starts one ring out")
+            a = find_seg(c, "a.bin")
+            spec.assert_true(a.start >= big.start, "a within big (start)")
+            spec.assert_true(a.start + a.sweep <= big.start + big.sweep + 0.0001, "a within big (end)")
+            spec.assert_eq(cents(a.inner), cents(big.outer), "a is one ring further out")
+        }
+        spec.it("hits the centre disc and a ring segment") callback {
+            c = chart_build(sample(), "T")
+            chart_layout(c, 400.0, 400.0)
+            centre = chart_hit(c, 200.0, 200.0)
+            spec.assert_eq(centre.depth, 0, "centre is the root")
+            big = find_seg(c, "big")
+            mid_a = big.start + big.sweep / 2.0
+            mid_r = (big.inner + big.outer) / 2.0
+            hx = 200.0 + mid_r * math.cos(mid_a)
+            hy = 200.0 + mid_r * math.sin(mid_a)
+            hit = chart_hit(c, hx, hy)
+            spec.assert_not_null(hit as ptr, "hit something")
+            spec.assert_str_eq(hit.name, "big", "the middle of big is big")
+            spec.assert_null(chart_hit(c, 1.0, 1.0) as ptr, "a corner is outside")
+        }
+    }
+
+    spec.describe(fw, "palette") {
+        spec.it("dims deeper rings, brightens highlights, keeps the centre grey") callback {
+            d1 = palette_rgb(50.0, 1, 0, 0) + palette_rgb(50.0, 1, 0, 1) + palette_rgb(50.0, 1, 0, 2)
+            d5 = palette_rgb(50.0, 5, 0, 0) + palette_rgb(50.0, 5, 0, 1) + palette_rgb(50.0, 5, 0, 2)
+            spec.assert_true(d5 < d1, "depth 5 darker than depth 1")
+            hr = palette_rgb(50.0, 5, 1, 0)
+            hg = palette_rgb(50.0, 5, 1, 1)
+            hb = palette_rgb(50.0, 5, 1, 2)
+            mx = math.max_float(hr, math.max_float(hg, hb))
+            spec.assert_true(mx > 0.999, "highlight brightest channel is 1")
+            spec.assert_eq(math.round(palette_rgb(10.0, 0, 0, 0) * 255.0) as int, 211, "centre r #D3")
+            spec.assert_eq(math.round(palette_rgb(10.0, 0, 0, 1) * 255.0) as int, 214, "centre g #D6")
+            spec.assert_eq(math.round(palette_rgb(10.0, 0, 0, 2) * 255.0) as int, 209, "centre b #D1")
+        }
+    }
+    return spec.run_summary(fw)
+}
