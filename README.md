@@ -27,13 +27,9 @@ it. The build takes aether-ui's `ui` and `vg` modules and its per-OS backend
 link setup from there, so nothing here duplicates them. (On Windows, clone
 with `core.symlinks=true`.)
 
-The port needs these Aether fixes, which are unreleased as of 0.716.0:
-- a trailing block on a struct-field assignment
-- `_` bound inside a loop
-- `fs.hard_link`, used by the tests
-
-They are on aether's `wip/opendisk-port-fixes` branch, with a handoff note in
-`asks/`. Until they ship, build `aether` from that branch.
+The port needs Aether ≥ 0.717.0, which carries three fixes it relies on (a
+trailing block on a struct-field assignment; `_` bound inside a loop;
+`fs.hard_link`, used by the tests).
 
 ## Build, run, test
 
