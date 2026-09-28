@@ -31,6 +31,9 @@ test/run_tests.sh || fail=$((fail + $?))
 echo "=== od_watch seam (test/test_watch.sh) ==="
 test/test_watch.sh || fail=$((fail + $?))
 
+echo "=== od_native seam (test/test_native.sh) ==="
+test/test_native.sh || fail=$((fail + $?))
+
 echo "=== AetherUIDriver specs (spec/) ==="
 od_xvfb=0
 if [ "$(uname -s)" = "Linux" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then

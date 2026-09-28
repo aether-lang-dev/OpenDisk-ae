@@ -96,6 +96,14 @@ main() {
             hdr = text("Select a Disk")
             _b = style_font_size(hdr, 20.0)
             _bb = style_font_bold(hdr)
+            // Full Disk Access banner — hidden except when od_app's check_fda
+            // finds a real probe DENIED (macOS only; see od_native).
+            hstack(8) {
+                a.fda_notice = text("Full Disk Access is off — some folders may show fewer items.")
+                a.fda_btn = btn("Open Settings…") callback { od_app.open_fda_settings(a) }
+            }
+            _hf1 = set_hidden(a.fda_notice, 1)
+            _hf2 = set_hidden(a.fda_btn, 1)
             a.devices = each("v", 6) callback |item: ptr, i: int, parent: int| {
                 d = item as *Device
                 row = hstack(parent, 10)
@@ -186,6 +194,7 @@ main() {
                             context_menu_item(row, "Add to Collector") callback { od_app.collect_row(a, rr) }
                             if od_view.is_synthetic(rp) == 0 {
                                 context_menu_item(row, "Open") callback { od_app.open_path(a, rp) }
+                                context_menu_item(row, "Quick Look") callback { od_app.quick_look_path(a, rp) }
                                 context_menu_item(row, "Show in File Manager") callback { od_app.reveal_path(a, rp) }
                                 context_menu_item(row, "Copy Path") callback { od_app.copy_path(a, rp) }
                             }
@@ -215,6 +224,9 @@ main() {
                             od_app.chart_click(a, vg.scene_px_to_vb_x(a.scene, px), vg.scene_px_to_vb_y(a.scene, py))
                         }
                         context_menu_item(a.cwid, "Add to Collector") callback { od_app.collect_hovered(a) }
+                        context_menu_item(a.cwid, "Quick Look") callback {
+                            if a.hovered != null { od_app.quick_look_path(a, a.hovered.path) }
+                        }
                         context_menu_item(a.cwid, "Show in File Manager") callback {
                             if a.hovered != null { od_app.reveal_path(a, a.hovered.path) }
                         }

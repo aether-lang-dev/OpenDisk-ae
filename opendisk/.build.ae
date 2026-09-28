@@ -10,7 +10,9 @@ import aether
 import aether (source, output, no_closure_regen, lib, extra_source)
 import build_support.aetherui (ui_backend)
 import std.os (platform)
+import std.os
 import std.string
+import std.fs (mkdir_p)
 
 main() {
     bldr.build() {
@@ -33,19 +35,54 @@ main() {
             // side ever imports the other OS's module, so a Linux/Windows
             // build never needs macae (which builds only on a Mac — see
             // macae/AGENTS.md) on the box at all.
+            // od_app.ae also imports `od_native` unconditionally (the
+            // mac.volume/quicklook/trash/workspace/fda seam), gated the
+            // same way as od_watch above.
             if string.equals(platform(), "darwin") == 1 {
                 lib("${root}/macae")
                 lib("${root}/opendisk/watch_mac")
+                lib("${root}/opendisk/native_mac")
                 // extra_source/link_flag opt aether.program() onto the manual
                 // aetherc+gcc path (already true here for od_stat.c/od_text.c),
                 // which does not auto-discover an imported module's own
                 // @source/@link the way a plain `ae build` shell-out would —
-                // so mac.fsevents's C half and its framework need naming here,
-                // same as od_stat.c/od_text.c above.
+                // so each macae module's C/ObjC half and any framework not
+                // already linked by ui_backend need naming here, same as
+                // od_stat.c/od_text.c above. Foundation, AppKit and ImageIO
+                // are already linked by ui_backend's own darwin branch.
                 extra_source("${root}/macae/mac/fsevents/fsevents.c")
+                extra_source("${root}/macae/mac/volume/volume.m")
+                extra_source("${root}/macae/mac/trash/trash.m")
+                extra_source("${root}/macae/mac/fda/fda.c")
                 link_flag("-Wl,-framework,CoreServices")
+                link_flag("-Wl,-framework,Quartz")
+                link_flag("-Wl,-framework,QuickLookThumbnailing")
+                link_flag("-Wl,-framework,CoreGraphics")
+
+                // quicklook.m and workspace.m call retain/release/autorelease
+                // directly (macae is deliberately non-ARC — see
+                // macae/AGENTS.md), which conflicts with aether-ui's own
+                // -fobjc-arc (its AppKit backend needs it, set by ui_backend
+                // above). aeb's manual link path compiles every extra_source
+                // in ONE clang invocation sharing ONE flag set, so ARC and
+                // non-ARC .m files can't both be extra_source in this build.
+                // Precompile just these two to plain .o objects with
+                // -fno-objc-arc here, then link the objects directly — a
+                // bare path in link_flag is just another positional input
+                // to the final clang command, same as any .o would be.
+                _native_obj_dir = "${root}/opendisk/.build_native"
+                mkdir_p(_native_obj_dir)
+                _ql_o = "${_native_obj_dir}/quicklook.o"
+                _ws_o = "${_native_obj_dir}/workspace.o"
+                _ql_rc = os.system("clang -c -O2 -fno-objc-arc -o ${_ql_o} ${root}/macae/mac/quicklook/quicklook.m")
+                if _ql_rc != 0 { bldr.fail("precompiling macae's quicklook.m (non-ARC) failed, rc=${_ql_rc}") }
+                _ws_rc = os.system("clang -c -O2 -fno-objc-arc -o ${_ws_o} ${root}/macae/mac/workspace/workspace.m")
+                if _ws_rc != 0 { bldr.fail("precompiling macae's workspace.m (non-ARC) failed, rc=${_ws_rc}") }
+                link_flag(_ql_o)
+                link_flag(_ws_o)
             } else {
                 lib("${root}/opendisk/watch_none")
+                lib("${root}/opendisk/native_none")
             }
         }
         return 0

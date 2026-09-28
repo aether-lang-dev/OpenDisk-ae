@@ -32,8 +32,8 @@ its per-OS backend link setup from there, so nothing here duplicates them.
 `opendisk/.build.ae` only follows the `macae` symlink on a macOS build
 (`std.os.platform() == "darwin"`); a Linux or Windows build never touches it,
 so it doesn't need to exist there. See [macae](https://github.com/aether-lang-dev/macae)
-if you don't have a sibling checkout yet — only its `mac.fsevents` module is
-used today.
+if you don't have a sibling checkout yet — `mac.fsevents`, `mac.volume`,
+`mac.quicklook`, `mac.trash`, `mac.workspace` and `mac.fda` are used today.
 
 The port needs Aether ≥ 0.717.0, which carries three fixes it relies on (a
 trailing block on a struct-field assignment; `_` bound inside a loop;
@@ -48,9 +48,10 @@ aeb opendisk/.build.ae                       # → target/build/opendisk/bin/ope
 
 test/run_tests.sh                            # unit suites (std.spec): no window needed
 test/test_watch.sh                           # od_watch: stub everywhere, real FSEvents round-trip on macOS
+test/test_native.sh                          # od_native: stub everywhere, all 5 macae calls exercised for real on macOS
 AETHER_UI_WITH_DRIVER=1 aeb opendisk/.build.ae
 spec/run.sh                                  # AetherUIDriver specs, one fresh app each
-./ci.sh                                      # all four, in that order
+./ci.sh                                      # all five, in that order
 ```
 
 In a sandbox or CI job whose `$HOME` is read-only, set `AETHER_CACHE_DIR` to a
@@ -62,7 +63,8 @@ writable directory: `ae run` caches compiled binaries there.
 |---|---|
 | `opendisk/` | the app: `opendisk.ae` builds the window, `od_*.ae` the rest, `od_stat.c` / `od_text.c` the per-OS C |
 | `opendisk/watch_none/`, `opendisk/watch_mac/` | the two `od_watch` implementations; `.build.ae` puts exactly one on the module path per OS |
-| `test/` | unit suites, one per module area, `std.spec` (plus `test_watch.sh`, outside `std.spec` — see its header) |
+| `opendisk/native_none/`, `opendisk/native_mac/` | the two `od_native` implementations (volume/quicklook/trash/workspace/fda), same one-of-two-on-the-path rule |
+| `test/` | unit suites, one per module area, `std.spec` (plus `test_watch.sh` and `test_native.sh`, outside `std.spec` — see their headers) |
 | `spec/` | AetherUIDriver specs, with `od_driver.ae` as their vocabulary and `run.sh` running them |
 
 ## How it maps onto OpenDisk
@@ -72,6 +74,7 @@ writable directory: `ae run` caches compiled binaries there.
 | `FileTree`, roll-up, hard-link dedup | `opendisk/od_tree.ae` | `test/test_tree.ae` |
 | `TraversalScanner` (allocated sizes, same device, no symlinks) | `opendisk/od_scan.ae`, `od_stat.c` | `test/test_scanner.ae` |
 | FSEvents rescan trigger (macOS scan cache not ported — see "Where it differs") | `opendisk/od_watch.ae` seam, `watch_mac`/`watch_none` | `test/test_watch.sh` |
+| Finder capacity, Quick Look, Trash, NSWorkspace, Full Disk Access probe | `opendisk/od_native.ae` seam, `native_mac`/`native_none` | `test/test_native.sh` |
 | `ChartItem`, `RingsChartLayout`, `ChartPalette` | `opendisk/od_chart.ae` | `test/test_chart.ae` |
 | `RingsChartView`, `ChartHoverTip` | `opendisk/od_draw.ae` | `spec/spec_chart.ae` |
 | `SearchIndex` | `od_search.ae`, `od_text.c` | `test/test_search.ae`, `spec/spec_search.ae` |
@@ -101,15 +104,37 @@ The constants and strings are OpenDisk's own:
   Windows builds never link `macae` at all (gated in `opendisk/.build.ae` by
   `std.os.platform()`) and fall back to manual-Rescan-only, unchanged from
   before.
-- **The macOS-only extras are otherwise dropped.** That covers the Full Disk
-  Access prompt, Move to Applications, Sparkle updates and sandbox
-  bookmarks. The last is replaced by *Recent Folders*: folders you scanned
-  before, stored in the OS's config directory (`$OPENDISK_CONFIG_DIR`
-  overrides it).
-- **"Purgeable Space"** is OpenDisk's list of known cache folders, with a Linux
-  and a Windows version added (`od_view.ae`).
-- **Quick Look is Open**, which uses the default app. *Show in Finder* is
-  *Show in File Manager*.
+- **The disk capacity bar matches Finder's number on macOS**, purgeable space
+  included, via macae's `mac.volume` (`native_capacity` in `od_native.ae`).
+  Elsewhere it's `fs.statvfs`'s raw free-block count, as before. The
+  "Purgeable Space" *row in the folder list* is a separate, still
+  cross-platform thing (OpenDisk-ae's own list of known cache folders,
+  `od_view.ae`) — unrelated to and not replaced by this.
+- **Quick Look, on macOS, is real Quick Look** (the Space-bar preview panel,
+  via `mac.quicklook`) — a new context menu item next to *Open*, on a row
+  and on the chart. Elsewhere "Quick Look" still falls back to opening the
+  file in its default app, the substitution this line used to describe
+  unconditionally.
+- **Deleting moves to the Trash on macOS** (`mac.trash`; Put Back works
+  afterwards), via a pluggable remover on `od_collector.ae`'s `Collector`
+  (default: permanent, unchanged elsewhere) that `od_app.ae` swaps in when
+  `native_trash_available()`. The confirmation card's wording and button
+  label switch accordingly.
+- **"Show in Finder" and "Open" go through NSWorkspace on macOS**
+  (`mac.workspace`): reveal actually selects the item instead of just
+  opening its parent folder, and the app launches through the same API
+  Finder itself uses. Elsewhere both still build a `file://` URL and hand
+  it to the OS's generic opener.
+- **A real Full Disk Access probe on macOS** (`mac.fda`): a banner on the
+  device-picker screen when it's actually denied, with a button straight to
+  the Settings pane — replacing "never knowing" with the same detection
+  OpenDisk's own prompt was built on. Suppressed under a driver spec or
+  `AETHER_UI_HEADLESS` (there's no user to act on it, and probing there is
+  noise, not signal).
+- **The macOS-only extras still not ported**: Move to Applications, Sparkle
+  updates and sandbox bookmarks. The last is replaced by *Recent Folders*:
+  folders you scanned before, stored in the OS's config directory
+  (`$OPENDISK_CONFIG_DIR` overrides it).
 - **Dragging from the chart is not ported.** The canvas has no drag source. The
   chart's context menu offers *Add to Collector* instead. List rows do drag,
   and a drop anywhere on the window collects.

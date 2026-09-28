@@ -5,8 +5,18 @@
 import std.spec
 import std.string
 import std.fs
+import std.os (platform)
 import od_driver
 import uidriver
+
+// On macOS the build wires od_collector's remover to macae's mac.trash (see
+// od_app.ae's app_new), so deleting moves to the Trash instead of unlinking
+// permanently — different confirmation copy and a differently-labelled
+// confirm button.
+is_macos() -> int {
+    if string.equals(platform(), "darwin") == 1 { return 1 }
+    return 0
+}
 
 // Context-menu item 0 on a list row is "Add to Collector".
 collect_row(name: string) {
@@ -55,17 +65,23 @@ main() {
         spec.it("asks before deleting, and Cancel keeps everything") callback {
             uidriver.click_widget(uidriver.widget_id_of("button", "Delete"))
             spec.assert_true(od_driver.wait_text("Delete 2 items?", 20), "confirmation")
-            spec.assert_true(od_driver.wait_text("can’t be undone", 5), "says it is permanent")
+            if is_macos() == 1 {
+                spec.assert_true(od_driver.wait_text("moves the collected items to the Trash", 5), "says it goes to the Trash")
+            } else {
+                spec.assert_true(od_driver.wait_text("can’t be undone", 5), "says it is permanent")
+            }
             uidriver.click_widget(uidriver.widget_id_of("button", "Cancel"))
             spec.assert_true(od_driver.wait_text("2 items collected", 20), "still collected")
             spec.assert_true(fs.exists("${fix}/tiny.txt"), "nothing deleted")
         }
-        spec.it("deletes the collected items permanently when confirmed") callback {
+        spec.it("deletes the collected items when confirmed (Trash on macOS, permanent elsewhere)") callback {
             uidriver.click_widget(uidriver.widget_id_of("button", "Delete"))
             spec.assert_true(od_driver.wait_text("Delete 2 items?", 20), "confirmation")
-            // the confirm button is "Delete <total>"
-            confirm = od_driver.button_starting("Delete ")
-            spec.assert_true(confirm > 0, "a Delete <size> button")
+            // the confirm button is "Delete <total>" (or "Move to Trash: <total>" on macOS)
+            confirm_prefix = "Delete "
+            if is_macos() == 1 { confirm_prefix = "Move to Trash: " }
+            confirm = od_driver.button_starting(confirm_prefix)
+            spec.assert_true(confirm > 0, "a Delete/Move-to-Trash <size> button")
             spec.assert_contains(uidriver.widget_text_by_id(confirm), "KB", "it names the size")
             uidriver.click_widget(confirm)
             // one item per heartbeat: wait for the files to go

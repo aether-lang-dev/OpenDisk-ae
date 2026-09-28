@@ -1,0 +1,48 @@
+// od_native — the portable seam od_app.ae (and, via a Collector remover
+// function, od_collector.ae) calls unconditionally to reach macae's
+// macOS-only capabilities, without ever importing a mac-only module
+// itself (see opendisk/.build.ae: exactly one of this file or
+// native_mac/od_native.ae is on the module path, chosen by
+// std.os.platform() at build time — never both).
+//
+// This is the Linux/Windows (and any other non-macOS) side: every
+// `*_available()` says no, so the app falls back to what it already did
+// (fs.statvfs for capacity, the existing open_url-based open/reveal,
+// permanent delete, and no Full Disk Access banner).
+
+exports (
+    native_volume_available, native_capacity,
+    native_quicklook_available, native_quicklook_preview,
+    native_trash_available, native_trash_item,
+    native_workspace_available, native_reveal, native_open,
+    native_fda_available, native_fda_probe, native_fda_open_settings,
+    FDA_GRANTED, FDA_DENIED, FDA_UNDETERMINED
+)
+
+const FDA_GRANTED: int = 1
+const FDA_DENIED: int = 0
+const FDA_UNDETERMINED: int = 2
+
+native_volume_available() -> int { return 0 }
+// (total, available, ok). ok=0 always here: the caller falls back to fs.statvfs.
+native_capacity(path: string) -> {
+    return 0, 0, 0
+}
+
+native_quicklook_available() -> int { return 0 }
+native_quicklook_preview(path: string) -> string { return "quick look not available" }
+
+native_trash_available() -> int { return 0 }
+// (where, err). Always an error here: the caller keeps its own path (no
+// native trash to defer to; od_collector's default remover stays in force).
+native_trash_item(path: string) -> {
+    return "", "trash not available"
+}
+
+native_workspace_available() -> int { return 0 }
+native_reveal(path: string) -> int { return 0 }
+native_open(path: string) -> int { return 0 }
+
+native_fda_available() -> int { return 0 }
+native_fda_probe() -> int { return FDA_UNDETERMINED }
+native_fda_open_settings() -> int { return 0 }

@@ -9,14 +9,18 @@
 //     folder drops any collected items inside it.
 //   - every change that actually changes the items is one undo step (a
 //     batch add is ONE step); no-ops push nothing. At most UNDO_LIMIT steps.
-//   - deletion is PERMANENT (no Trash — OpenDisk's own choice), one item at a
-//     time so a UI can show progress. Items that fail stay collected; the
-//     undo history is cleared afterwards.
+//   - deletion is PERMANENT by default (no Trash — OpenDisk's own choice),
+//     one item at a time so a UI can show progress. Items that fail stay
+//     collected; the undo history is cleared afterwards. A caller may swap
+//     in a different remover (set_remover) — od_app.ae uses this to move to
+//     the Trash on macOS via od_native, without this module ever knowing
+//     macae exists (keeps it importable by test/test_collector.ae's fixed
+//     AETHER_LIB_DIR, which has no macOS-only module on its path).
 //   - totals are the sizes recorded when collected (nothing is re-measured).
 
 exports (
     Collector, Item, collector_new, add, add_batch, remove, clear, undo, can_undo,
-    count, total_bytes, contains, item_at, set_rules, notice,
+    count, total_bytes, contains, item_at, set_rules, notice, set_remover, Remover,
     delete_begin, delete_step, delete_all, deleting, del_done, del_total, del_freed,
     del_failures, del_current, del_deleted, item_new, UNDO_LIMIT
 )
@@ -31,6 +35,10 @@ import od_tree
 extern malloc(size: int) -> ptr
 
 const UNDO_LIMIT: int = 50
+
+// A remover takes the path to remove and returns "" on success or an error
+// string. The default (default_remove) is a permanent fs.remove_tree.
+type Remover = fn(string) -> string
 
 struct Item {
     path: string,
@@ -53,8 +61,15 @@ struct Collector {
     long del_freed_bytes,
     del_deleted_count: int,
     del_fail: ptr,          // std.strarr of failed paths
-    del_name: string
+    del_name: string,
+    remover: Remover
 }
+
+default_remove(path: string) -> string { return fs.remove_tree(path) }
+
+// Swap in a different removal function (e.g. move-to-Trash on macOS). The
+// default is permanent deletion via fs.remove_tree.
+set_remover(c: *Collector, r: Remover) { c.remover = r }
 
 item_new(path: string, size: long, is_dir: int) -> *Item {
     it = malloc(sizeof(Item)) as *Item
@@ -79,6 +94,7 @@ collector_new() -> *Collector {
     c.del_deleted_count = 0
     c.del_fail = strarr.new()
     c.del_name = ""
+    c.remover = default_remove
     return c
 }
 
@@ -253,7 +269,7 @@ delete_step(c: *Collector) -> int {
         // Already gone is a failure, not a success: those bytes were not
         // freed by us (OpenDisk's removeItem reports it the same way).
         err = "no longer exists"
-        if fs.exists(it.path) == 1 { err = fs.remove_tree(it.path) }
+        if fs.exists(it.path) == 1 { err = c.remover(it.path) }
         if string.length(err) == 0 {
             if fs.exists(it.path) == 1 { err = "could not be removed" }
         }

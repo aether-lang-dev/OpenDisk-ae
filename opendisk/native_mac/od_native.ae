@@ -1,0 +1,100 @@
+// od_native — the macOS side of the seam (see native_none/od_native.ae for
+// the portable fallback and opendisk/.build.ae for which one gets built).
+//
+// Thin wrappers over five of macae's modules, each replacing or upgrading
+// something the port otherwise approximates or drops — see macae/AGENTS.md's
+// "next" list and this repo's README ("Where it differs, and why"):
+//   - mac.volume    → the capacity bar matches Finder's number (purgeable
+//                     space included), not just fs.statvfs's raw free bytes.
+//   - mac.quicklook → a real Quick Look preview panel, not just "Open".
+//   - mac.trash     → deleting moves to the Trash (Put Back works),
+//                     not a permanent unlink.
+//   - mac.workspace → "Show in Finder" actually selects the item, and
+//                     "Open" goes through NSWorkspace, not a file:// URL.
+//   - mac.fda       → a real "Full Disk Access is off" probe for the
+//                     device-picker banner, instead of never knowing.
+//
+// Every module's own available() is a hardcoded 1 (it means "compiled in",
+// which importing it here already establishes), so the native_*_available()
+// wrappers below say 1 directly rather than importing five same-named
+// `available` symbols into one file.
+
+exports (
+    native_volume_available, native_capacity,
+    native_quicklook_available, native_quicklook_preview,
+    native_trash_available, native_trash_item,
+    native_workspace_available, native_reveal, native_open,
+    native_fda_available, native_fda_probe, native_fda_open_settings,
+    FDA_GRANTED, FDA_DENIED, FDA_UNDETERMINED
+)
+
+import mac.volume (read, total, important)
+import mac.quicklook (preview, preview_available)
+import mac.trash (item)
+import mac.workspace (reveal, open_path)
+import mac.fda (probe, open_settings)
+
+// Literal, not aliased from mac.fda's own GRANTED/DENIED/UNDETERMINED: an
+// imported module's `const` has no linkable C symbol of its own to
+// initialize one of ours from (aetherc emits `static const int
+// od_native_FDA_GRANTED = (fda_GRANTED);` referencing a symbol that was
+// never defined — undeclared identifier at link time). These values are
+// mac.fda's own (module.ae: GRANTED=1, DENIED=0, UNDETERMINED=2) and are
+// part of its documented contract, so hardcoding them here is exactly as
+// stable as importing them would have been.
+const FDA_GRANTED: int = 1
+const FDA_DENIED: int = 0
+const FDA_UNDETERMINED: int = 2
+
+native_volume_available() -> int { return 1 }
+
+// (total, available, ok). available is Finder's "important" figure
+// (purgeable space included); ok=0 means the volume couldn't be read, and
+// the caller should fall back to fs.statvfs.
+//
+// Deliberately ONE return point, not an early `return 0, 0, 0` ahead of the
+// real `return total(), important(), 1`: that shape reproducibly returned a
+// stale/wrong `total()` (241631232 instead of the real ~245GB, confirmed
+// against fs.statvfs and diskutil) while `important()` on the SAME call
+// stayed correct — a genuine Aether codegen bug with a multi-value-return
+// function that has an early return of a differently-shaped tuple before
+// its main one, independent of which externs are involved (reproduced with
+// mac.volume alone, no other macae module needed). Tracked to file
+// upstream; this shape sidesteps it.
+native_capacity(path: string) -> {
+    ok = read(path)
+    long t = 0
+    long avail = 0
+    result_ok = 0
+    if ok == 1 {
+        t = total()
+        avail = important()
+        result_ok = 1
+    }
+    return t, avail, result_ok
+}
+
+native_quicklook_available() -> int {
+    if preview_available() == 1 { return 1 }
+    return 0
+}
+// "" on success, an error string otherwise (the caller falls back to
+// od_app.open_path on any non-empty result).
+native_quicklook_preview(path: string) -> string { return preview(path) }
+
+native_trash_available() -> int { return 1 }
+// (where, err), same shape as mac.trash.item.
+native_trash_item(path: string) -> {
+    where, err = item(path)
+    return where, err
+}
+
+native_workspace_available() -> int { return 1 }
+// 1 = handled (Finder opened with the item selected); 0 = refused
+// (headless) or failed — the caller falls back to its own file:// URL path.
+native_reveal(path: string) -> int { return reveal(path) }
+native_open(path: string) -> int { return open_path(path) }
+
+native_fda_available() -> int { return 1 }
+native_fda_probe() -> int { return probe() }
+native_fda_open_settings() -> int { return open_settings() }

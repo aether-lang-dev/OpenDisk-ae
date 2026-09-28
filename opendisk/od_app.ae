@@ -12,7 +12,7 @@ exports (
     collect_row, collect_hovered, uncollect, undo_collect, ask_delete, confirm_delete,
     cancel_delete, ask_unmount, confirm_unmount, cancel_unmount, chart_move, chart_click,
     open_path, reveal_path, copy_path, rescan, row_at_index, sort_label,
-    show_picker, scan_folder, chart_paint, VB
+    show_picker, scan_folder, chart_paint, quick_look_path, open_fda_settings, VB
 )
 
 import ui
@@ -47,6 +47,14 @@ import od_recent
 import od_draw
 import od_watch
 import od_watch (watch_available, watch_start, watch_stop, watch_changed)
+import od_native
+import od_native (
+    native_volume_available, native_capacity,
+    native_quicklook_available, native_quicklook_preview,
+    native_trash_available, native_trash_item,
+    native_workspace_available, native_reveal, native_open,
+    native_fda_available, native_fda_probe, native_fda_open_settings, FDA_DENIED
+)
 
 extern malloc(size: int) -> ptr
 extern aether_ui_set_enabled(handle: int, enabled: int)
@@ -61,6 +69,8 @@ struct App {
     devices: ptr,           // ui.each of device rows
     recents: ptr,           // ui.each of recent-folder rows
     recents_title: int,
+    fda_notice: int,        // "Full Disk Access is off" banner (macOS only)
+    fda_btn: int,
     // analysis widgets
     title: int,
     subtitle: int,
@@ -133,6 +143,8 @@ app_new() -> *App {
     a.devices = null
     a.recents = null
     a.recents_title = 0
+    a.fda_notice = 0
+    a.fda_btn = 0
     a.title = 0
     a.subtitle = 0
     a.search_field = 0
@@ -183,12 +195,20 @@ app_new() -> *App {
     a.my = 0.0
     a.dirty = 1
     a.col = collector_new()
+    if native_trash_available() == 1 { od_collector.set_remover(a.col, trash_remove_item) }
     a.notice_t = 0.0
     a.del_done_t = 0.0
     a.now = 0.0
     a.os = od_protected.host_os()
     a.home = od_protected.home_dir()
     return a
+}
+
+// Bridges od_native's (where, err) shape to od_collector's Remover
+// (path -> err); only ever installed when native_trash_available() == 1.
+trash_remove_item(path: string) -> string {
+    _where, err = native_trash_item(path)
+    return err
 }
 
 now_s() -> float {
@@ -198,6 +218,17 @@ now_s() -> float {
 
 headless() -> int {
     if os_getenv("AETHER_UI_HEADLESS") != null { return 1 }
+    return 0
+}
+
+// A driver-spec run (a real window, opendisk.ae's own
+// AETHER_UI_TEST_PORT check) rather than a genuinely headless one —
+// distinct from headless() because check_fda's banner needs suppressing
+// there too: this box's own FDA state is incidental to whatever a spec is
+// testing, and its text has already collided with an unrelated assertion
+// searching visible text by substring.
+under_test() -> int {
+    if os_getenv("AETHER_UI_TEST_PORT") != null { return 1 }
     return 0
 }
 
@@ -219,6 +250,43 @@ refresh_devices(a: *App) {
             _h = set_hidden(a.recents_title, list.size(l) == 0)
         }
     }
+    check_fda(a)
+}
+
+// Full Disk Access banner (macOS only): shown only when the probe says
+// DENIED, so a Linux/Windows build (native_fda_available() == 0) and a
+// granted/undetermined macOS box never see it. Probing touches disk, so
+// this only runs when the picker is (re)shown, not every tick.
+check_fda(a: *App) {
+    if a.fda_notice == 0 { return }
+    // Headless, or driven by a spec (a real window, but under
+    // AETHER_UI_TEST_PORT): skip the probe entirely and keep the banner
+    // hidden either way. There's no user to act on it, and this box's own
+    // FDA state is incidental to whatever a spec is actually testing —
+    // several specs search visible text by substring, and a stray
+    // "…items." in the banner text has already collided with one
+    // ("totals the folder in the status bar" wanting " items" from the
+    // total, not the banner).
+    if headless() == 1 {
+        _h1 = set_hidden(a.fda_notice, 1)
+        if a.fda_btn != 0 { _h2 = set_hidden(a.fda_btn, 1) }
+        return
+    }
+    if under_test() == 1 {
+        _h1b = set_hidden(a.fda_notice, 1)
+        if a.fda_btn != 0 { _h2b = set_hidden(a.fda_btn, 1) }
+        return
+    }
+    denied = 0
+    if native_fda_available() == 1 {
+        if native_fda_probe() == FDA_DENIED { denied = 1 }
+    }
+    _h3 = set_hidden(a.fda_notice, denied == 0)
+    if a.fda_btn != 0 { _h4 = set_hidden(a.fda_btn, denied == 0) }
+}
+
+open_fda_settings(a: *App) {
+    _ = native_fda_open_settings()
 }
 
 show_picker(a: *App) {
@@ -289,7 +357,17 @@ scan_folder(a: *App) {
     start_analysis(a, p, nm, 0)
 }
 
+// Finder's capacity number (purgeable space counted as free) on macOS via
+// mac.volume; fs.statvfs's raw free-block count everywhere else.
 read_capacity(a: *App) {
+    if native_volume_available() == 1 {
+        total, avail, ok = native_capacity(a.root_path)
+        if ok == 1 {
+            a.cap_total = total
+            a.cap_avail = avail
+            return
+        }
+    }
     total, _free, avail, err = fs.statvfs(a.root_path)
     if string.length(err) == 0 {
         a.cap_total = total
@@ -665,10 +743,16 @@ ask_delete(a: *App) {
     if n != 1 { what = "items" }
     card = root_vstack(10)
     _t = text(card, "Delete ${n} ${what}?")
-    _m = text(card, "This permanently deletes the collected items and can’t be undone.")
+    btn_label = "Delete "
+    if native_trash_available() == 1 {
+        _m = text(card, "This moves the collected items to the Trash.")
+        btn_label = "Move to Trash: "
+    } else {
+        _m = text(card, "This permanently deletes the collected items and can’t be undone.")
+    }
     row = hstack(card, 8)
     _c = btn(row, "Cancel") callback { cancel_delete(a) }
-    _d = btn(row, string.concat("Delete ", od_fmt.file_size(od_collector.total_bytes(a.col)))) callback {
+    _d = btn(row, string.concat(btn_label, od_fmt.file_size(od_collector.total_bytes(a.col)))) callback {
         confirm_delete(a)
     }
     a.overlay = overlay_modal(0, card, "center", 0, 0) callback { a.overlay = 0 }
@@ -727,10 +811,35 @@ open_path(a: *App, p: string) {
         _t = set_text(a.status, string.concat("Open: ", p))
         return
     }
+    if native_workspace_available() == 1 {
+        if native_open(p) == 1 { return }
+    }
     open_url(file_url(p))
 }
 
+// The Space-bar-style Quick Look preview on macOS; everywhere else this is
+// the same substitution the README already documented (open the file in
+// its default app).
+quick_look_path(a: *App, p: string) {
+    if headless() == 1 {
+        _t = set_text(a.status, string.concat("Quick Look: ", p))
+        return
+    }
+    if native_quicklook_available() == 1 {
+        err = native_quicklook_preview(p)
+        if string.length(err) == 0 { return }
+    }
+    open_path(a, p)
+}
+
 reveal_path(a: *App, p: string) {
+    if headless() == 0 {
+        // NSWorkspace's reveal selects the exact item; only fall back to
+        // opening its parent folder when that's not available.
+        if native_workspace_available() == 1 {
+            if native_reveal(p) == 1 { return }
+        }
+    }
     d = p
     kind, _s, _m, err = fs.file_stat(p)
     if string.length(err) == 0 { if kind != 2 { d = parent_path(p) } }
