@@ -18,14 +18,22 @@ scm/
   aether/        the Aether toolchain; `ae` must be on PATH, e.g. aether/build
   aeb/           the build runner; `aeb` on PATH
   aether-ui/     the UI toolkit — reached through this repo's `aether-ui` symlink
+  macae/         macOS-only natives — reached through this repo's `macae` symlink
+                 (optional: needed only when building on macOS; see below)
   OpenDisk-ae/   this repo
 ```
 
-`aether-ui` and `build_support` at the repo root are **relative symlinks**
-into `../aether-ui`. Point `aether-ui` at another checkout to build against
-it. The build takes aether-ui's `ui` and `vg` modules and its per-OS backend
-link setup from there, so nothing here duplicates them. (On Windows, clone
-with `core.symlinks=true`.)
+`aether-ui`, `build_support` and `macae` at the repo root are **relative
+symlinks** into `../aether-ui` and `../macae`. Point them at another checkout
+to build against it. The build takes aether-ui's `ui` and `vg` modules and
+its per-OS backend link setup from there, so nothing here duplicates them.
+(On Windows, clone with `core.symlinks=true`.)
+
+`opendisk/.build.ae` only follows the `macae` symlink on a macOS build
+(`std.os.platform() == "darwin"`); a Linux or Windows build never touches it,
+so it doesn't need to exist there. See [macae](https://github.com/aether-lang-dev/macae)
+if you don't have a sibling checkout yet — only its `mac.fsevents` module is
+used today.
 
 The port needs Aether ≥ 0.717.0, which carries three fixes it relies on (a
 trailing block on a struct-field assignment; `_` bound inside a loop;
@@ -39,9 +47,10 @@ aeb opendisk/.build.ae                       # → target/build/opendisk/bin/ope
 ./target/build/opendisk/bin/opendisk ~/Downloads   # opens straight into a scan
 
 test/run_tests.sh                            # unit suites (std.spec): no window needed
+test/test_watch.sh                           # od_watch: stub everywhere, real FSEvents round-trip on macOS
 AETHER_UI_WITH_DRIVER=1 aeb opendisk/.build.ae
 spec/run.sh                                  # AetherUIDriver specs, one fresh app each
-./ci.sh                                      # all three, in that order
+./ci.sh                                      # all four, in that order
 ```
 
 In a sandbox or CI job whose `$HOME` is read-only, set `AETHER_CACHE_DIR` to a
@@ -52,7 +61,8 @@ writable directory: `ae run` caches compiled binaries there.
 | Path | What |
 |---|---|
 | `opendisk/` | the app: `opendisk.ae` builds the window, `od_*.ae` the rest, `od_stat.c` / `od_text.c` the per-OS C |
-| `test/` | unit suites, one per module area, `std.spec` |
+| `opendisk/watch_none/`, `opendisk/watch_mac/` | the two `od_watch` implementations; `.build.ae` puts exactly one on the module path per OS |
+| `test/` | unit suites, one per module area, `std.spec` (plus `test_watch.sh`, outside `std.spec` — see its header) |
 | `spec/` | AetherUIDriver specs, with `od_driver.ae` as their vocabulary and `run.sh` running them |
 
 ## How it maps onto OpenDisk
@@ -61,6 +71,7 @@ writable directory: `ae run` caches compiled binaries there.
 |---|---|---|
 | `FileTree`, roll-up, hard-link dedup | `opendisk/od_tree.ae` | `test/test_tree.ae` |
 | `TraversalScanner` (allocated sizes, same device, no symlinks) | `opendisk/od_scan.ae`, `od_stat.c` | `test/test_scanner.ae` |
+| FSEvents rescan trigger (macOS scan cache not ported — see "Where it differs") | `opendisk/od_watch.ae` seam, `watch_mac`/`watch_none` | `test/test_watch.sh` |
 | `ChartItem`, `RingsChartLayout`, `ChartPalette` | `opendisk/od_chart.ae` | `test/test_chart.ae` |
 | `RingsChartView`, `ChartHoverTip` | `opendisk/od_draw.ae` | `spec/spec_chart.ae` |
 | `SearchIndex` | `od_search.ae`, `od_text.c` | `test/test_search.ae`, `spec/spec_search.ae` |
@@ -79,12 +90,22 @@ The constants and strings are OpenDisk's own:
 
 ## Where it differs, and why
 
-- **No FSEvents incremental rescans.** Every scan is a full scan, as OpenDisk
-  does the first time. OpenDisk's macOS scan cache is not ported either.
-- **The macOS-only extras are dropped.** That covers the Full Disk Access prompt,
-  Move to Applications, Sparkle updates and sandbox bookmarks. The last is
-  replaced by *Recent Folders*: folders you scanned before, stored in the OS's
-  config directory (`$OPENDISK_CONFIG_DIR` overrides it).
+- **FSEvents auto-rescan, on macOS only.** A macOS build watches the scanned
+  root (via [macae](https://github.com/aether-lang-dev/macae)'s
+  `mac.fsevents`) and triggers a fresh full rescan on its own when something
+  changes underneath it, debounced to at most once every two seconds — see
+  `opendisk/od_watch.ae` (the seam) and its `watch_mac`/`watch_none`
+  implementations. This is *auto-triggered*, not *incremental*: it still
+  re-reads everything, just without you having to click Rescan. OpenDisk's
+  own per-subtree patch and its macOS scan cache are not ported. Linux and
+  Windows builds never link `macae` at all (gated in `opendisk/.build.ae` by
+  `std.os.platform()`) and fall back to manual-Rescan-only, unchanged from
+  before.
+- **The macOS-only extras are otherwise dropped.** That covers the Full Disk
+  Access prompt, Move to Applications, Sparkle updates and sandbox
+  bookmarks. The last is replaced by *Recent Folders*: folders you scanned
+  before, stored in the OS's config directory (`$OPENDISK_CONFIG_DIR`
+  overrides it).
 - **"Purgeable Space"** is OpenDisk's list of known cache folders, with a Linux
   and a Windows version added (`od_view.ae`).
 - **Quick Look is Open**, which uses the default app. *Show in Finder* is

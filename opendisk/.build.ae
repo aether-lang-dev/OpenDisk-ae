@@ -9,6 +9,8 @@ import bldr
 import aether
 import aether (source, output, no_closure_regen, lib, extra_source)
 import build_support.aetherui (ui_backend)
+import std.os (platform)
+import std.string
 
 main() {
     bldr.build() {
@@ -24,6 +26,27 @@ main() {
             extra_source("od_text.c")
             no_closure_regen()
             ui_backend(ui)
+            // od_app.ae imports `od_watch` unconditionally; exactly one of
+            // these two directories is ever on the module path, so the
+            // import resolves to the real macae-backed implementation on
+            // macOS and to the portable no-op stub everywhere else. Neither
+            // side ever imports the other OS's module, so a Linux/Windows
+            // build never needs macae (which builds only on a Mac — see
+            // macae/AGENTS.md) on the box at all.
+            if string.equals(platform(), "darwin") == 1 {
+                lib("${root}/macae")
+                lib("${root}/opendisk/watch_mac")
+                // extra_source/link_flag opt aether.program() onto the manual
+                // aetherc+gcc path (already true here for od_stat.c/od_text.c),
+                // which does not auto-discover an imported module's own
+                // @source/@link the way a plain `ae build` shell-out would —
+                // so mac.fsevents's C half and its framework need naming here,
+                // same as od_stat.c/od_text.c above.
+                extra_source("${root}/macae/mac/fsevents/fsevents.c")
+                link_flag("-Wl,-framework,CoreServices")
+            } else {
+                lib("${root}/opendisk/watch_none")
+            }
         }
         return 0
     }

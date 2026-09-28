@@ -45,6 +45,8 @@ import od_protected
 import od_devices
 import od_recent
 import od_draw
+import od_watch
+import od_watch (watch_available, watch_start, watch_stop, watch_changed)
 
 extern malloc(size: int) -> ptr
 extern aether_ui_set_enabled(handle: int, enabled: int)
@@ -94,6 +96,10 @@ struct App {
     scan_secs: float,
     last_refresh: float,
     root: *Node,
+    // native change-watching (macOS only; watch_start returns null and
+    // watch_changed always says "no" everywhere else — see od_watch)
+    watch: ptr,
+    watch_cooldown: float,
     // where we are: a folder path under the root, or PURGEABLE_PATH
     current: string,
     back: ptr,              // strarr of earlier `current`s
@@ -160,6 +166,8 @@ app_new() -> *App {
     a.scan_secs = 0.0
     a.last_refresh = 0.0
     a.root = null as *Node
+    a.watch = null
+    a.watch_cooldown = 0.0
     a.current = ""
     a.back = strarr.new()
     a.rows = list.new()
@@ -218,6 +226,7 @@ show_picker(a: *App) {
         scan_cancel(a.scan)
         a.scanning = 0
     }
+    stop_watch(a)
     refresh_devices(a)
     _h1 = set_hidden(a.analysis, 1)
     _h2 = set_hidden(a.picker, 0)
@@ -236,7 +245,39 @@ start_analysis(a: *App, path: string, name: string, used: long) {
     _h1 = set_hidden(a.picker, 1)
     _h2 = set_hidden(a.analysis, 0)
     if used == 0 { od_recent.recent_add(path) }
+    restart_watch(a, path)
     begin_scan(a, path)
+}
+
+// (Re)watch `path` for changes from now on. Replaces any earlier watch —
+// there is only ever one, on the whole root, regardless of which subfolder
+// `current` is looking at. A no-op everywhere watch_available() is 0.
+restart_watch(a: *App, path: string) {
+    stop_watch(a)
+    if watch_available() == 1 { a.watch = watch_start(path) }
+}
+
+stop_watch(a: *App) {
+    if a.watch != null {
+        watch_stop(a.watch)
+        a.watch = null
+    }
+    a.watch_cooldown = 0.0
+}
+
+// Called once per tick while idle. A change anywhere under the root
+// triggers the same full rescan a manual Rescan would — see od_watch's
+// header for why this isn't (yet) a finer-grained per-subtree patch. The
+// cooldown keeps a burst of writes (a download, a build) from queuing one
+// rescan per event; the next check after it elapses picks up anything that
+// arrived meanwhile, same as if the user re-checked by hand.
+check_watch(a: *App) {
+    if a.watch == null { return }
+    if a.now < a.watch_cooldown { return }
+    if watch_changed(a.watch) == 1 {
+        a.watch_cooldown = a.now + 2.0
+        begin_scan(a, a.root_path)
+    }
 }
 
 // "Scan Folder…": pick one, then analyse it.
@@ -307,6 +348,8 @@ tick(a: *App) {
                 refresh(a)
             }
         }
+    } else {
+        check_watch(a)
     }
     if od_collector.deleting(a.col) == 1 {
         if od_collector.delete_step(a.col) == 0 { finish_delete(a) }

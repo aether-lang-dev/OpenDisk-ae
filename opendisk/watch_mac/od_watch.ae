@@ -1,0 +1,42 @@
+// od_watch — the macOS side of the seam (see watch_none/od_watch.ae for the
+// portable fallback and opendisk/.build.ae for which one gets built).
+//
+// A thin wrapper over macae's mac.fsevents: watch_start opens a watch with a
+// short coalescing latency (so a flurry of writes collapses into one
+// change), watch_changed drains and reports whether anything arrived since
+// the last call. od_app.ae doesn't care WHAT changed, only THAT something
+// did — it responds by re-running the same full scan a manual Rescan would,
+// just without the user having to ask. A true per-subtree patch (only
+// re-reading the changed folder) is future work; this is the same shape
+// OpenDisk's own README describes ("re-scans take seconds") without yet
+// carrying the fine-grained MUST_SCAN_SUBDIRS/path plumbing that would let
+// it skip re-reading the untouched parts of a large disk.
+
+exports (watch_available, watch_start, watch_stop, watch_changed)
+
+import mac.fsevents (open, poll, close, available)
+
+watch_available() -> int { return available() }
+
+// 1.0s latency: long enough to coalesce a save-editor's write-then-rename,
+// short enough that a change still shows up well within one human "did it
+// update?" glance.
+watch_start(path: string) -> ptr {
+    w, err = open(path, 1.0)
+    if w == null { return null }
+    return w
+}
+
+watch_stop(w: ptr) {
+    if w != null { close(w) }
+}
+
+// Returns 1 if anything was delivered since the last call (and drains the
+// batch); 0 otherwise. od_app.ae debounces further on its own side, so this
+// only needs to say yes/no, not what or where.
+watch_changed(w: ptr) -> int {
+    if w == null { return 0 }
+    n = poll(w)
+    if n > 0 { return 1 }
+    return 0
+}

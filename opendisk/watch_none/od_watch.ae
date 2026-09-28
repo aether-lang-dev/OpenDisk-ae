@@ -1,0 +1,22 @@
+// od_watch — the portable seam od_app.ae calls unconditionally to learn
+// about filesystem changes under the scanned root, without ever importing
+// a mac-only module itself (see opendisk/.build.ae: exactly one of this
+// file or watch_mac/od_watch.ae is on the module path, chosen by
+// std.os.platform() at build time — never both).
+//
+// This is the Linux/Windows (and any other non-macOS) side: there is no
+// native change-notification wired up yet, so watch_available() says so and
+// the rest are no-ops. od_app.ae falls back to what it always did — a
+// manual Rescan only.
+
+exports (watch_available, watch_start, watch_stop, watch_changed)
+
+watch_available() -> int { return 0 }
+
+// `path` is unused here (see watch_mac/od_watch.ae for the real signature);
+// named the same for parity, and to keep the call site identical either way.
+watch_start(path: string) -> ptr { return null }
+
+watch_stop(w: ptr) { }
+
+watch_changed(w: ptr) -> int { return 0 }
