@@ -46,7 +46,7 @@ import od_devices
 import od_recent
 import od_draw
 import od_watch
-import od_watch (watch_available, watch_start, watch_stop, watch_changed)
+import od_watch (watch_available, watch_start, watch_stop, watch_poll)
 import od_native
 import od_native (
     native_volume_available, native_capacity,
@@ -303,6 +303,17 @@ show_picker(a: *App) {
 // Open the analysis screen on `path` (a disk: `used` bytes in use, for the
 // progress bar; a folder: 0 — the bar then shows no fraction).
 start_analysis(a: *App, path: string, name: string, used: long) {
+    // Resolve once, up front: the tree's own paths (from scan_new) and the
+    // FSEvents watch (via restart_watch) both need to agree on ONE spelling
+    // of this path. macOS resolves symlinks like /tmp -> /private/tmp and
+    // /var -> /private/var in what FSEvents reports back, but a scan
+    // stores paths exactly as given — realpath-ing only the INCOMING event
+    // (which od_scan.merge_one does) can't fix a root that was never
+    // resolved in the first place, since the two sides would then share no
+    // common prefix at all and every incremental merge would silently
+    // find nothing to attach to.
+    rp, _kind, rerr = fs.realpath(path)
+    if string.length(rerr) == 0 { path = rp }
     a.root_path = path
     a.root_name = name
     a.used_total = used
@@ -333,19 +344,40 @@ stop_watch(a: *App) {
     a.watch_cooldown = 0.0
 }
 
-// Called once per tick while idle. A change anywhere under the root
-// triggers the same full rescan a manual Rescan would — see od_watch's
-// header for why this isn't (yet) a finer-grained per-subtree patch. The
-// cooldown keeps a burst of writes (a download, a build) from queuing one
-// rescan per event; the next check after it elapses picks up anything that
-// arrived meanwhile, same as if the user re-checked by hand.
+// Called once per tick while idle. Merges whichever directories changed
+// into the tree in place (od_scan.merge_changed_paths) rather than
+// re-reading the whole disk — unless the batch itself said it couldn't be
+// trusted (give_up: a dropped/wrapped/root-changed FSEvents stream), in
+// which case a full rescan is the only safe answer. The cooldown keeps a
+// burst of writes (a download, a build) from queuing one merge per event;
+// the next check after it elapses picks up anything that arrived meanwhile.
 check_watch(a: *App) {
     if a.watch == null { return }
     if a.now < a.watch_cooldown { return }
-    if watch_changed(a.watch) == 1 {
+    paths, give_up = watch_poll(a.watch)
+    if give_up == 1 {
         a.watch_cooldown = a.now + 2.0
         begin_scan(a, a.root_path)
+        return
     }
+    if strarr.size(paths) == 0 { return }
+    a.watch_cooldown = a.now + 2.0
+    if od_scan.merge_changed_paths(a.root, paths) == 1 { finish_incremental(a) }
+}
+
+// After an incremental merge changed the tree in place: the same
+// bookkeeping finish_scan does for a full scan, minus what only applies to
+// an actual scan-in-progress (a.scanning, a.scan_secs). The search index is
+// always rebuilt from scratch (index_build walks live nodes only — a
+// detached one is no longer reachable from a.root — and is cheap in
+// memory compared to the disk reads the merge already avoided).
+finish_incremental(a: *App) {
+    a.index = index_build(a.root, 0)
+    if is_synthetic(a.current) == 0 {
+        if node_for_path(a.root, a.current) == null { a.current = a.root_path }
+    }
+    if a.searching == 1 { a.results = search(a.index, a.query, SCOPE_ALL) }
+    refresh(a)
 }
 
 // "Scan Folder…": pick one, then analyse it.

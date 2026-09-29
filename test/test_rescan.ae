@@ -1,0 +1,156 @@
+// od_scan's incremental merge (merge_changed_paths / merge_one /
+// nearest_existing / replace_root_children): rescanning just the changed
+// directories and swapping them into an existing tree in place, the way
+// od_app.ae's check_watch drives it from od_watch's FSEvents reports. Pure
+// tree/filesystem logic, no macae dependency — real temp files, same style
+// as test_scanner.ae.
+import std.spec
+import std.list
+import std.string
+import std.strarr
+import std.fs
+import std.os
+import od_tree
+import od_tree (Node, node_for_path, child_count, count_nodes)
+import od_scan
+import od_scan (Scan, scan_new, scan_run, merge_changed_paths)
+
+fresh_dir(tag: string) -> string {
+    p, err = fs.make_temp_dir(os.temp_dir(), string.concat("odrescan-", tag))
+    return p
+}
+
+mk(dir: string, name: string, n: int) -> string {
+    p = string.concat(dir, string.concat("/", name))
+    s = "x"
+    while string.length(s) < n { s = string.concat(s, s) }
+    _w = fs.write(p, string.substring(s, 0, n))
+    return p
+}
+
+one(path: string) -> ptr {
+    a = strarr.new()
+    _ = strarr.push_copy(a, path)
+    return a
+}
+
+main() {
+    fw = spec.init()
+
+    spec.describe(fw, "od_scan.merge_changed_paths") {
+        spec.it("picks up a new file added under an existing folder") callback {
+            d = fresh_dir("add")
+            _m = fs.create_dir(string.concat(d, "/sub"))
+            _a = mk(string.concat(d, "/sub"), "a.bin", 100)
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_eq(count_nodes(s.root), 3, "root + sub + a.bin")
+
+            new_file = mk(string.concat(d, "/sub"), "b.bin", 200)
+            changed = merge_changed_paths(s.root, one(new_file))
+            spec.assert_eq(changed, 1, "reports a change")
+            spec.assert_eq(count_nodes(s.root), 4, "root + sub + a.bin + b.bin")
+            spec.assert_true(s.root.size >= 300, "root rolled up to include it")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("picks up a file removed from disk") callback {
+            d = fresh_dir("remove")
+            _m = fs.create_dir(string.concat(d, "/sub"))
+            a = mk(string.concat(d, "/sub"), "a.bin", 100)
+            _b = mk(string.concat(d, "/sub"), "b.bin", 200)
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_eq(count_nodes(s.root), 4, "root + sub + a.bin + b.bin")
+
+            _r1 = fs.remove_tree(a)
+            changed = merge_changed_paths(s.root, one(a))
+            spec.assert_eq(changed, 1, "reports a change")
+            spec.assert_eq(count_nodes(s.root), 3, "root + sub + b.bin only")
+            sub = node_for_path(s.root, string.concat(d, "/sub"))
+            spec.assert_not_null(sub as ptr, "sub still there")
+            spec.assert_eq(child_count(sub), 1, "one child left")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("picks up a file that grew") callback {
+            d = fresh_dir("grow")
+            a = mk(d, "a.bin", 100)
+            s = scan_new(d, "root")
+            scan_run(s)
+            before = s.root.size
+
+            content = "y"
+            while string.length(content) < 5000 { content = string.concat(content, content) }
+            _w2 = fs.write(a, content)
+            changed = merge_changed_paths(s.root, one(a))
+            spec.assert_eq(changed, 1, "reports a change")
+            spec.assert_true(s.root.size > before, "root grew with it")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("picks up a whole new nested folder in one merge") callback {
+            d = fresh_dir("nested")
+            _a = mk(d, "a.bin", 50)
+            s = scan_new(d, "root")
+            scan_run(s)
+            spec.assert_eq(count_nodes(s.root), 2, "root + a.bin")
+
+            _m = fs.create_dir(string.concat(d, "/new"))
+            new_file = mk(string.concat(d, "/new"), "c.bin", 300)
+            // FSEvents (FILE_EVENTS mode) would report the file's own path,
+            // not "new/" — merge_one must walk up to find "new" doesn't
+            // exist either, then land on root.
+            changed = merge_changed_paths(s.root, one(new_file))
+            spec.assert_eq(changed, 1, "reports a change")
+            spec.assert_eq(count_nodes(s.root), 4, "root + a.bin + new + c.bin")
+            nw = node_for_path(s.root, string.concat(d, "/new"))
+            spec.assert_not_null(nw as ptr, "new folder present")
+            spec.assert_eq(child_count(nw), 1, "c.bin inside it")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("leaves an untouched sibling subtree's Node objects alone") callback {
+            d = fresh_dir("sibling")
+            _ma = fs.create_dir(string.concat(d, "/A"))
+            _mb = fs.create_dir(string.concat(d, "/B"))
+            _a = mk(string.concat(d, "/A"), "a.bin", 100)
+            _b = mk(string.concat(d, "/B"), "b.bin", 100)
+            s = scan_new(d, "root")
+            scan_run(s)
+            b_before = node_for_path(s.root, string.concat(d, "/B"))
+            spec.assert_not_null(b_before as ptr, "B found")
+
+            new_file = mk(string.concat(d, "/A"), "a2.bin", 400)
+            changed = merge_changed_paths(s.root, one(new_file))
+            spec.assert_eq(changed, 1, "reports a change")
+            b_after = node_for_path(s.root, string.concat(d, "/B"))
+            spec.assert_eq(b_after as ptr, b_before as ptr, "B is the SAME Node object, not rebuilt")
+            spec.assert_eq(b_after.detached, 0, "B was never detached")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("handles a change reported at the root's own path") callback {
+            d = fresh_dir("root")
+            _a = mk(d, "a.bin", 100)
+            s = scan_new(d, "root")
+            scan_run(s)
+            root_before = s.root
+
+            new_file = mk(d, "b.bin", 200)
+            changed = merge_changed_paths(s.root, one(new_file))
+            spec.assert_eq(changed, 1, "reports a change")
+            spec.assert_eq(s.root as ptr, root_before as ptr, "root Node object kept alive")
+            spec.assert_eq(count_nodes(s.root), 3, "root + a.bin + b.bin")
+            _r = fs.remove_tree(d)
+        }
+        spec.it("reports no change for a path outside the tree") callback {
+            d = fresh_dir("outside")
+            _a = mk(d, "a.bin", 100)
+            s = scan_new(d, "root")
+            scan_run(s)
+            before = count_nodes(s.root)
+
+            changed = merge_changed_paths(s.root, one("/definitely/not/under/this/tree.txt"))
+            spec.assert_eq(changed, 0, "no change reported")
+            spec.assert_eq(count_nodes(s.root), before, "tree untouched")
+            _r = fs.remove_tree(d)
+        }
+    }
+    return spec.run_summary(fw)
+}

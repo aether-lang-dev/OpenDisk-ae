@@ -1,0 +1,51 @@
+// spec_incremental_rescan.ae — a file dropped directly onto the scanned
+// folder's disk (not through the app at all: another process, exactly what
+// an external app or Finder does) shows up in the list on its own, without
+// a manual Rescan. Distinguishes a real incremental MERGE (od_scan's
+// merge_changed_paths) from the app secretly doing a full rescan by
+// checking the "Scanned in X.Xs" status text is UNCHANGED afterward — a
+// full rescan recomputes that duration from a fresh a.scan_t0, so it would
+// almost certainly read a different value; an incremental merge never
+// touches it at all (od_app.ae's finish_incremental).
+import std.spec
+import std.string
+import std.fs
+import od_driver
+import uidriver
+
+main() {
+    fw = spec.init()
+    od_driver.wait_for_app()
+    fix = od_driver.fixture_path()
+
+    spec.describe(fw, "OpenDisk: incremental rescan on a real filesystem change") {
+        spec.it("picks up a file created directly on disk, without a manual Rescan") callback {
+            spec.assert_true(string.length(od_driver.text_containing("Scanned in")) > 0, "scan duration shown")
+            before_scan_text = od_driver.text_containing("Scanned in")
+            spec.assert_false(string.contains(od_driver.list_names(), "dropped.bin"), "not present yet")
+
+            _w = fs.write("${fix}/dropped.bin", "incremental rescan probe")
+
+            seen = 0
+            i = 0
+            while i < 40 {
+                if string.contains(od_driver.list_names(), "dropped.bin") == 1 { seen = 1; i = 40 }
+                else { sleep(150); i = i + 1 }
+            }
+            spec.assert_true(seen == 1, "dropped.bin appeared on its own")
+            spec.assert_str_eq(od_driver.text_containing("Scanned in"), before_scan_text,
+                "scan duration unchanged -- this was a merge, not a fresh full rescan")
+        }
+        spec.it("picks up a file removed directly from disk, the same way") callback {
+            _r = fs.remove_tree("${fix}/tiny.txt")
+            gone = 0
+            i = 0
+            while i < 40 {
+                if string.contains(od_driver.list_names(), "tiny.txt") == 0 { gone = 1; i = 40 }
+                else { sleep(150); i = i + 1 }
+            }
+            spec.assert_true(gone == 1, "tiny.txt disappeared on its own")
+        }
+    }
+    return spec.run_summary(fw)
+}

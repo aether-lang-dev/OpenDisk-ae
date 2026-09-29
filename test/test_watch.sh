@@ -20,7 +20,9 @@ run_case() {
     label="$1"; libdir="$2"; body="$3"
     work="$(mktemp -d)"
     cat > "$work/t.ae" <<EOF
-import od_watch (watch_available, watch_start, watch_stop, watch_changed)
+import od_watch (watch_available, watch_start, watch_stop, watch_poll)
+import std.strarr
+import std.string
 import std.fs
 extern exit(code: int)
 main() {
@@ -40,12 +42,14 @@ EOF
 }
 
 echo "=== od_watch: the portable stub (watch_none) ==="
-run_case "watch_available() is 0, start/changed are safe no-ops" \
+run_case "watch_available() is 0, start/poll are safe no-ops" \
     "$APP/watch_none" \
     'if watch_available() != 0 { println("FAIL: expected unavailable"); exit(1) }
     w = watch_start("/tmp")
     if w != null { println("FAIL: expected null watch"); exit(1) }
-    if watch_changed(w) != 0 { println("FAIL: expected no change"); exit(1) }
+    paths, give_up = watch_poll(w)
+    if strarr.size(paths) != 0 { println("FAIL: expected no paths"); exit(1) }
+    if give_up != 0 { println("FAIL: expected give_up=0"); exit(1) }
     println("stub OK")'
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -55,25 +59,37 @@ fi
 
 echo "=== od_watch: the macOS side (watch_mac), backed by macae ==="
 watch_dir="$(mktemp -d)"
-run_case "reports a real FSEvents change after a file is created" \
+run_case "reports the new file's real path (macae runs FSEvents in FILE_EVENTS mode, not directory-level)" \
     "$APP/watch_mac:$ROOT/macae" \
     "if watch_available() == 0 { println(\"FAIL: expected available on macOS\"); exit(1) }
     w = watch_start(\"$watch_dir\")
     if w == null { println(\"FAIL: expected a watch handle\"); exit(1) }
     // Give the watch a moment to actually open before the change it
     // should see, then write the file from inside the same program —
-    // no cross-process race to get right.
+    // no cross-process race to get right. FSEvents resolves symlinks in
+    // what it reports (e.g. /tmp -> /private/tmp), so compare against the
+    // DIRECTORY's realpath as a prefix — the reported path is the file
+    // itself, not its containing directory (macae's fsevents.c passes
+    // kFSEventStreamCreateFlagFileEvents, confirmed by inspection).
     sleep(300)
     _err = fs.write(\"$watch_dir/new_file.txt\", \"hello\")
+    want_dir, _k, _e = fs.realpath(\"$watch_dir\")
     seen = 0
     tries = 0
     while tries < 40 {
-        if watch_changed(w) == 1 { seen = 1; tries = 40 } else {
+        paths, give_up = watch_poll(w)
+        if give_up == 1 { println(\"FAIL: unexpected give_up\"); exit(1) }
+        j = 0
+        while j < strarr.size(paths) {
+            if string.starts_with(strarr.get(paths, j), want_dir) == 1 { seen = 1; j = strarr.size(paths) }
+            j = j + 1
+        }
+        if seen == 1 { tries = 40 } else {
             sleep(100)
             tries = tries + 1
         }
     }
-    if seen == 0 { println(\"FAIL: no change observed\"); exit(1) }
+    if seen == 0 { println(\"FAIL: watched directory never reported changed\"); exit(1) }
     watch_stop(w)
     println(\"watch_mac OK\")"
 rm -rf "$watch_dir"

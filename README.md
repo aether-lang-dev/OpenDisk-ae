@@ -64,7 +64,7 @@ writable directory: `ae run` caches compiled binaries there.
 | `opendisk/` | the app: `opendisk.ae` builds the window, `od_*.ae` the rest, `od_stat.c` / `od_text.c` the per-OS C |
 | `opendisk/watch_none/`, `opendisk/watch_mac/` | the two `od_watch` implementations; `.build.ae` puts exactly one on the module path per OS |
 | `opendisk/native_none/`, `opendisk/native_mac/` | the two `od_native` implementations (volume/quicklook/trash/workspace/fda), same one-of-two-on-the-path rule |
-| `test/` | unit suites, one per module area, `std.spec` (plus `test_watch.sh` and `test_native.sh`, outside `std.spec` — see their headers) |
+| `test/` | unit suites, one per module area, `std.spec` — including `test_rescan.ae` (od_scan's incremental-merge logic, pure, no macae dependency) — plus `test_watch.sh` and `test_native.sh`, outside `std.spec` (see their headers) |
 | `spec/` | AetherUIDriver specs, with `od_driver.ae` as their vocabulary and `run.sh` running them |
 
 ## How it maps onto OpenDisk
@@ -73,7 +73,7 @@ writable directory: `ae run` caches compiled binaries there.
 |---|---|---|
 | `FileTree`, roll-up, hard-link dedup | `opendisk/od_tree.ae` | `test/test_tree.ae` |
 | `TraversalScanner` (allocated sizes, same device, no symlinks) | `opendisk/od_scan.ae`, `od_stat.c` | `test/test_scanner.ae` |
-| FSEvents rescan trigger (macOS scan cache not ported — see "Where it differs") | `opendisk/od_watch.ae` seam, `watch_mac`/`watch_none` | `test/test_watch.sh` |
+| FSEvents incremental merge (macOS scan cache not ported — see "Where it differs") | `opendisk/od_watch.ae` seam (`watch_mac`/`watch_none`), `od_scan.ae`'s `merge_changed_paths` | `test/test_watch.sh`, `test/test_rescan.ae`, `spec/spec_incremental_rescan.ae` |
 | Finder capacity, Quick Look, Trash, NSWorkspace, Full Disk Access probe | `opendisk/od_native.ae` seam, `native_mac`/`native_none` | `test/test_native.sh` |
 | `ChartItem`, `RingsChartLayout`, `ChartPalette` | `opendisk/od_chart.ae` | `test/test_chart.ae` |
 | `RingsChartView`, `ChartHoverTip` | `opendisk/od_draw.ae` | `spec/spec_chart.ae`, `spec/spec_chart_drag.ae` |
@@ -93,17 +93,23 @@ The constants and strings are OpenDisk's own:
 
 ## Where it differs, and why
 
-- **FSEvents auto-rescan, on macOS only.** A macOS build watches the scanned
-  root (via [macae](https://github.com/aether-lang-dev/macae)'s
-  `mac.fsevents`) and triggers a fresh full rescan on its own when something
-  changes underneath it, debounced to at most once every two seconds — see
-  `opendisk/od_watch.ae` (the seam) and its `watch_mac`/`watch_none`
-  implementations. This is *auto-triggered*, not *incremental*: it still
-  re-reads everything, just without you having to click Rescan. OpenDisk's
-  own per-subtree patch and its macOS scan cache are not ported. Linux and
-  Windows builds never link `macae` at all (gated in `opendisk/.build.ae` by
-  `std.os.platform()`) and fall back to manual-Rescan-only, unchanged from
-  before.
+- **FSEvents incremental rescan, on macOS only.** A macOS build watches the
+  scanned root (via [macae](https://github.com/aether-lang-dev/macae)'s
+  `mac.fsevents`, which runs FSEvents in its fine-grained FILE_EVENTS mode)
+  and, when something changes underneath it, rescans and merges in just the
+  affected directories — `od_scan.ae`'s `merge_changed_paths` walks up from
+  each changed path to the nearest directory the tree already has and swaps
+  in a fresh subtree there via `od_tree.ae`'s `remove_child`/`node_add`
+  (`Node.detached` and the search index's own staleness check are what let
+  this be safe — both already existed for exactly this). Debounced to at
+  most once every two seconds; a dropped/wrapped FSEvents batch (rare) falls
+  back to a full rescan for that cycle instead of trusting partial data. Not
+  carried across merges: whole-tree hard-link dedup (each rescanned
+  directory starts its own dedup set — see `od_scan.ae`'s own note) and
+  OpenDisk's macOS scan cache. `opendisk/od_watch.ae` is the seam
+  (`watch_mac`/`watch_none`); Linux and Windows builds never link `macae` at
+  all (gated in `opendisk/.build.ae` by `std.os.platform()`) and fall back to
+  manual-Rescan-only, unchanged from before.
 - **The disk capacity bar matches Finder's number on macOS**, purgeable space
   included, via macae's `mac.volume` (`native_capacity` in `od_native.ae`).
   Elsewhere it's `fs.statvfs`'s raw free-block count, as before. The

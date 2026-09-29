@@ -16,7 +16,7 @@ case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && LIB="$(cygpath -m "$APP")" ;;
 esac
 
-SUITES=(formatters tree search chart protected collector scanner devices view)
+SUITES=(formatters tree search chart protected collector scanner rescan devices view)
 [ $# -gt 0 ] && SUITES=("$@")
 
 cd "$HERE"

@@ -3,26 +3,40 @@
 //
 // A thin wrapper over macae's mac.fsevents: watch_start opens a watch with a
 // short coalescing latency (so a flurry of writes collapses into one
-// change), watch_changed drains and reports whether anything arrived since
-// the last call. od_app.ae doesn't care WHAT changed, only THAT something
-// did — it responds by re-running the same full scan a manual Rescan would,
-// just without the user having to ask. A true per-subtree patch (only
-// re-reading the changed folder) is future work; this is the same shape
-// OpenDisk's own README describes ("re-scans take seconds") without yet
-// carrying the fine-grained MUST_SCAN_SUBDIRS/path plumbing that would let
-// it skip re-reading the untouched parts of a large disk.
+// change), watch_poll drains the batch and reports the paths named.
+// macae's fsevents.c always passes kFSEventStreamCreateFlagFileEvents
+// (confirmed by inspection, and by what it actually reports — a plain
+// directory watch with that flag OFF would coalesce to "this directory's
+// listing changed" instead), so what comes back is the FILE'S own path,
+// not just its containing directory. od_scan.ae's merge_one already
+// expects this: it walks up from whatever path it's given to the nearest
+// node the tree already has (nearest_existing), which is the file's
+// directory for a brand-new file, or a directory outright if that's what
+// changed. A MUST_SCAN_SUBDIRS-flagged event still needs no special
+// handling here — merge_one rescans that directory recursively regardless
+// of which flags came with it.
+//
+// A dropped/wrapped/root-changed batch (rare: a kernel buffer overflow, or
+// the watched root itself was replaced) can't be trusted for per-path
+// replay, so watch_poll flags it separately and od_app.ae falls back to a
+// full rescan for that cycle instead of trying to merge partial data.
 
-exports (watch_available, watch_start, watch_stop, watch_changed)
+exports (watch_available, watch_start, watch_stop, watch_poll)
 
-import mac.fsevents (open, poll, close, available)
+import std.string
+import std.strarr
+import mac.fsevents (
+    open, poll, close, available, path, flags, is_set,
+    USER_DROPPED, KERNEL_DROPPED, IDS_WRAPPED, ROOT_CHANGED
+)
 
 watch_available() -> int { return available() }
 
 // 1.0s latency: long enough to coalesce a save-editor's write-then-rename,
 // short enough that a change still shows up well within one human "did it
 // update?" glance.
-watch_start(path: string) -> ptr {
-    w, err = open(path, 1.0)
+watch_start(dir: string) -> ptr {
+    w, err = open(dir, 1.0)
     if w == null { return null }
     return w
 }
@@ -31,12 +45,38 @@ watch_stop(w: ptr) {
     if w != null { close(w) }
 }
 
-// Returns 1 if anything was delivered since the last call (and drains the
-// batch); 0 otherwise. od_app.ae debounces further on its own side, so this
-// only needs to say yes/no, not what or where.
-watch_changed(w: ptr) -> int {
-    if w == null { return 0 }
-    n = poll(w)
-    if n > 0 { return 1 }
+contains(arr: ptr, s: string) -> int {
+    i = 0
+    while i < strarr.size(arr) {
+        if string.equals(strarr.get(arr, i), s) == 1 { return 1 }
+        i = i + 1
+    }
     return 0
+}
+
+// Drains everything delivered since the last call. Returns (changed_paths,
+// give_up): changed_paths is a std.strarr of the distinct directories
+// FSEvents named (deduplicated — a busy directory can appear many times in
+// one batch); give_up is 1 when the batch itself said it can't be trusted
+// (dropped/wrapped/root-changed), meaning the caller should do a full
+// rescan instead of merging changed_paths (which may still hold some real
+// entries even when give_up is set — merge them too if you like, a full
+// rescan afterward makes them redundant but not wrong).
+watch_poll(w: ptr) -> {
+    changed_paths = strarr.new()
+    give_up = 0
+    if w == null { return changed_paths, give_up }
+    n = poll(w)
+    i = 0
+    while i < n {
+        fl = flags(w, i)
+        if is_set(fl, USER_DROPPED) == 1 { give_up = 1 }
+        if is_set(fl, KERNEL_DROPPED) == 1 { give_up = 1 }
+        if is_set(fl, IDS_WRAPPED) == 1 { give_up = 1 }
+        if is_set(fl, ROOT_CHANGED) == 1 { give_up = 1 }
+        p = path(w, i)
+        if contains(changed_paths, p) == 0 { _ = strarr.push_copy(changed_paths, p) }
+        i = i + 1
+    }
+    return changed_paths, give_up
 }

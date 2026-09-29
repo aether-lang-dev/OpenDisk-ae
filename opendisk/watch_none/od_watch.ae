@@ -9,7 +9,9 @@
 // the rest are no-ops. od_app.ae falls back to what it always did — a
 // manual Rescan only.
 
-exports (watch_available, watch_start, watch_stop, watch_changed)
+exports (watch_available, watch_start, watch_stop, watch_poll)
+
+import std.strarr
 
 watch_available() -> int { return 0 }
 
@@ -19,4 +21,8 @@ watch_start(path: string) -> ptr { return null }
 
 watch_stop(w: ptr) { }
 
-watch_changed(w: ptr) -> int { return 0 }
+// (changed_paths, give_up). Always empty/0 here — od_app.ae never gets a
+// path to merge, so it never calls into the incremental-merge path at all.
+watch_poll(w: ptr) -> {
+    return strarr.new(), 0
+}

@@ -11,14 +11,33 @@
 //   - items = files + folders seen (the root not included)
 // It is a work queue drained from the app's frame tick (scan_step), so the
 // window stays live and the tree grows while it scans; scan_run drains it
-// in one go (tests, CLI). macOS-only accelerations (getattrlistbulk,
-// FSEvents incremental rescans) are not ported: every scan is a full scan.
+// in one go (tests, CLI). getattrlistbulk is not ported (every directory
+// read is dir.list + od_stat.stat_try per entry). FSEvents incremental
+// rescans ARE ported, as a per-subtree MERGE: merge_changed_paths (below)
+// rescans just the affected directories and swaps the fresh subtrees into
+// the existing tree in place — see od_app.ae's check_watch, which drives
+// this from od_watch's FSEvents reports. Those reports are FILE-level, not
+// directory-level (macae's fsevents.c runs FILE_EVENTS mode), so
+// merge_one walks up from whatever path it's given to the nearest node the
+// tree already has — the file's own directory for a brand-new file. It is
+// not free: whichever directory that resolves to still gets its own full
+// recursive scan (there is no cheaper "just this one file changed" path,
+// since a folder's total needs its whole listing regardless), and a
+// whole-tree hard-link dedup is not carried across separate merges (see
+// merge_changed_paths's own note) — but it re-reads only the directories
+// that actually changed, not the whole disk, which is the expensive part a
+// full rescan pays for every time.
 
-exports (Scan, scan_new, scan_step, scan_run, scan_cancel, scan_done, join_path)
+exports (
+    Scan, scan_new, scan_step, scan_run, scan_cancel, scan_done, join_path,
+    merge_changed_paths
+)
 
 import std.string
 import std.list
+import std.strarr
 import std.dir
+import std.fs (realpath)
 import od_stat
 import od_tree
 import od_tree (Node, node_new, node_add, LinkSet, links_new, link_claim)
@@ -160,3 +179,128 @@ scan_cancel(s: *Scan) {
 }
 
 scan_done(s: *Scan) -> int { return s.finished }
+
+// ─── Incremental merge ─────────────────────────────────────────────
+//
+// od_watch reports the directories FSEvents named as changed. For each one
+// this rescans that directory (recursively — scan_run doesn't stop at one
+// level) and swaps the fresh subtree into the existing tree in place, via
+// od_tree's remove_child/node_add (the same pair test_tree.ae already
+// covers) and the `detached` flag they set, which od_search.ae already
+// respects when filtering stale results. Everything else that reads the
+// tree by PATH rather than by held Node pointer (App.current, the
+// Collector's items, chart rebuild) self-corrects the next time it's read,
+// same as it already does after any full rescan.
+//
+// NOT carried across a merge: hard-link dedup. Each fresh subtree scan
+// starts its own LinkSet (scan_new's normal behaviour), so a file whose
+// only OTHER link sits outside the rescanned subtree gets counted again
+// instead of zeroed — the same file, previously deduped against a sibling
+// elsewhere in the tree, now looks like it grew. Rare in practice (most
+// hard links inside a home folder come from tools that co-locate both
+// links under one changed directory, so they still dedup against each
+// other within that one rescan) and not attempted here; a full Rescan
+// re-establishes one whole-tree LinkSet and corrects it.
+
+// Rescans each of `paths` (a std.strarr of directories) and merges them
+// into `root`. Returns 1 if anything in the tree actually changed (worth a
+// roll_up/refresh), 0 if every path was outside what `root` covers.
+merge_changed_paths(root: *Node, paths: ptr) -> int {
+    changed = 0
+    i = 0
+    n = strarr.size(paths)
+    while i < n {
+        if merge_one(root, strarr.get(paths, i)) == 1 { changed = 1 }
+        i = i + 1
+    }
+    if changed == 1 { _ = od_tree.roll_up(root) }
+    return changed
+}
+
+// The deepest node in `root`'s tree that is `path` or an ancestor of it —
+// walking up past anything not yet in the tree, which covers FSEvents
+// coalescing fast enough to report a grandchild before its own parent has
+// ever been scanned (a brand-new nested folder created in one burst).
+nearest_existing(root: *Node, path: string) -> *Node {
+    p = path
+    while string.length(p) > 0 {
+        n = od_tree.node_for_path(root, p)
+        if n != null { return n }
+        if string.equals(p, root.path) == 1 { return null as *Node }
+        parent = od_tree.parent_path(p)
+        if string.equals(parent, p) == 1 { return null as *Node }
+        p = parent
+    }
+    return null as *Node
+}
+
+// Rescans `root`'s own path fresh and swaps in the new children, keeping
+// the SAME root Node alive: od_app.ae's a.root (and everything derived from
+// it — a.scan.root, current_node()) points at this object across the
+// merge, unlike a non-root target, which has a parent to reattach a
+// brand-new Node under.
+replace_root_children(root: *Node) -> int {
+    old = root.children
+    k = list.size(old)
+    i = 0
+    while i < k {
+        (list.list_get_raw(old, i) as *Node).detached = 1
+        i = i + 1
+    }
+    fresh = scan_new(root.path, root.name)
+    scan_run(fresh)
+    root.children = fresh.root.children
+    return 1
+}
+
+// FSEvents (and realpath in general) reports fully symlink-resolved paths
+// — macOS resolves /tmp -> /private/tmp, /var -> /private/var, and any
+// symlinked volume mount, in whatever it hands back — but a scan stores
+// paths exactly as its root was given, which may not itself be resolved.
+// Re-express an already-realpath'd `rp` under root's OWN spelling, so the
+// plain string-prefix matching node_for_path/is_ancestor_path do still
+// works regardless of which form the tree happened to start with. A no-op
+// when root's own path is already fully resolved (the common case once a
+// caller realpaths its own root up front, as od_app.ae's start_analysis
+// does) or when `rp` doesn't look like it's under the resolved root at
+// all (falls through unchanged; the checks that follow then correctly
+// find nothing to merge, same as any other unrelated path).
+rebase_to_root_spelling(root: *Node, rp: string) -> string {
+    root_rp, _k, rerr = realpath(root.path)
+    if string.length(rerr) > 0 { return rp }
+    if string.equals(root_rp, root.path) == 1 { return rp }
+    if string.equals(rp, root_rp) == 1 { return root.path }
+    base = root_rp
+    if string.ends_with(base, "/") == 0 { base = string.concat(base, "/") }
+    if string.starts_with(rp, base) == 0 { return rp }
+    rest = string.substring(rp, string.length(base), string.length(rp))
+    return join_path(root.path, rest)
+}
+
+merge_one(root: *Node, changed_path: string) -> int {
+    rp, _kind, rerr = realpath(changed_path)
+    if string.length(rerr) > 0 { rp = changed_path }
+    if string.length(rp) == 0 { return 0 }
+    rp = rebase_to_root_spelling(root, rp)
+    // Above root entirely (shouldn't happen — the watch is opened AT
+    // root's path — but a defensive no-op if it ever does: nothing here to
+    // merge, the caller's full-rescan fallback on a give_up batch is what
+    // actually covers this).
+    if od_tree.is_ancestor_path(rp, root.path) == 1 { return 0 }
+    target = nearest_existing(root, rp)
+    if target == null { return 0 }
+    if target.is_dir == 0 {
+        // FSEvents named a path we know as a FILE node — its containing
+        // directory is what actually changed (the file itself was
+        // replaced/resized). parent_path is strictly shallower than rp, so
+        // this recursion terminates.
+        return merge_one(root, od_tree.parent_path(target.path))
+    }
+    if target == root { return replace_root_children(root) }
+    parent = target.parent
+    fresh = scan_new(target.path, target.name)
+    scan_run(fresh)
+    _ = od_tree.remove_child(parent, target)
+    node_add(parent, fresh.root)
+    return 1
+}
