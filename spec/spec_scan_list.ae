@@ -24,6 +24,14 @@ main() {
         spec.it("lists the contents largest first") callback {
             spec.assert_str_eq(od_driver.list_names(), "Movies|Music|Documents|tiny.txt", "order")
         }
+        spec.it("shows a file icon per row, inset from the window's left edge") callback {
+            icon = od_driver.first_image_id()
+            spec.assert_true(icon > 0, "an icon widget exists")
+            x = uidriver.widget_int_field_by_id(icon, "x")
+            spec.assert_eq(x, 5, "5px window gutter, matching OpenDisk")
+            w = uidriver.widget_int_field_by_id(icon, "w")
+            spec.assert_eq(w, 16, "a real icon size, not a zero-size placeholder")
+        }
         spec.it("sorts by name, and back by size") callback {
             nb = uidriver.widget_id_of("button", "Name")
             uidriver.click_widget(nb)

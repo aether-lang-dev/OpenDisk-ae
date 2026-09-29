@@ -17,7 +17,7 @@ exports (
     click_row, crumbs_line, wait_crumbs, text_containing, wait_text, canvas_id,
     chart_a11y, hover_chart_vb, hover_segment, click_segment_named, click_chart_centre,
     chart_px_x, chart_px_y, collector_title, collector_sub, widget_visible, button_starting,
-    chart_rgb, chart_drag_payload
+    chart_rgb, chart_drag_payload, first_image_id
 )
 
 import std.string
@@ -241,6 +241,26 @@ wait_crumbs(want: string, tries: int) -> int {
 // ─── The chart ────────────────────────────────────────────────────
 
 canvas_id() -> int { return uidriver.widget_id_of("canvas", "") }
+
+// The id of the first "image" widget (a list row's file icon) in on-screen
+// order, or 0 if none — e.g. every scan currently in progress builds no
+// rows yet, or headless/no-icon-available cases. Its x is what proves the
+// window's edge_insets gutter: 0 would mean flush against the frame.
+first_image_id() -> int {
+    body = uidriver.get_body("/widgets")
+    v, _e = json.parse(body)
+    if v == null { return 0 }
+    found = 0
+    n = json.json_array_size(v)
+    i = 0
+    while i < n {
+        w = json.json_array_get_raw(v, i)
+        if found == 0 { if string.equals(jstr(w, "type"), "image") == 1 { found = jint(w, "id") } }
+        i = i + 1
+    }
+    json.json_free(v)
+    return found
+}
 
 // The chart's viewBox is 500×500, fitted into the canvas widget (meet):
 // scale by the smaller side, centred.

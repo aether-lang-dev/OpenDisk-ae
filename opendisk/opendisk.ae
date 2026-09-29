@@ -54,7 +54,8 @@ import ui (window, vstack, hstack, btn, text, enable_test_server, timer, each,
     listbox, on_select, splitview, scrollview, textfield, progressbar, spacer,
     shortcut, context_menu_item, draggable, on_file_drop, canvas_on_click, canvas_on_move,
     width, height, fill_width, fill_height, set_hidden, a11y_label, a11y_role,
-    style_font_bold, style_font_size, style_text_color, text_truncate)
+    style_font_bold, style_font_size, style_text_color, text_truncate,
+    edge_insets, file_icon, image_size)
 import vg.live (vg, canvas_region, region_set_animated)
 import vg
 import vg (view_box, rect)
@@ -161,6 +162,8 @@ main() {
                     lsv = scrollview() {
                         a.list = listbox(2) callback |item: ptr, i: int, row: int| {
                             r = item as *Row
+                            ic = file_icon(row, r.path)
+                            image_size(ic, 16, 16)
                             nm = text(row, r.name)
                             if r.is_dir == 1 { _nb = style_font_bold(nm) }
                             loc = ""
@@ -273,6 +276,15 @@ main() {
             }
         }
       }
+      // aether-ui's window content is flush against the frame by default
+      // (ui/module.ae's own edge_insets doc comment says so); OpenDisk
+      // keeps a small gutter around everything, 5px on every side. Must
+      // be right here: `root` is a plain local, not visible from inside
+      // its own initializer (so it can't go as root's first statement),
+      // and the shortcut/on_file_drop/timer setup below is a SIBLING of
+      // root inside window's block, not root's own content -- past that
+      // closing brace root is out of scope again.
+      _ei = edge_insets(root, 5.0, 5.0, 5.0, 5.0)
 
       // Keys: Ctrl+R rescans (Cmd+R on macOS), Ctrl+Z undoes the last
       // Collector change.
