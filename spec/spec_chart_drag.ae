@@ -1,0 +1,45 @@
+// spec_chart_drag.ae — the rings chart is a drag source: hovering a real
+// segment arms the canvas with its path, hovering the centre or empty space
+// un-arms it. A driver spec can't simulate an actual OS drag gesture, but
+// ui.draggable's own state (the payload the backend would hand to the drag
+// session) is inspectable through the widget's normal JSON info, which is
+// what this asserts — see od_app.ae's update_chart_drag and od_driver.ae's
+// chart_drag_payload().
+import std.spec
+import std.string
+import od_driver
+import uidriver
+
+main() {
+    fw = spec.init()
+    od_driver.wait_for_app()
+
+    spec.describe(fw, "OpenDisk: dragging out of the chart") {
+        spec.it("arms the canvas with a folder's path when hovered") callback {
+            a = od_driver.hover_segment("Movies", 1)
+            spec.assert_true(a >= 0.0, "Movies found on ring 1")
+            spec.assert_contains(od_driver.chart_drag_payload(), "Movies", "payload names Movies")
+        }
+        spec.it("arms the canvas with a file's path when hovered") callback {
+            a = od_driver.hover_segment("movie.mov", 2)
+            spec.assert_true(a >= 0.0, "movie.mov found on ring 2")
+            spec.assert_contains(od_driver.chart_drag_payload(), "movie.mov", "payload names movie.mov")
+        }
+        spec.it("un-arms when the centre (the whole folder, 'go back') is hovered") callback {
+            od_driver.hover_chart_vb(250.0, 250.0)
+            spec.assert_str_eq(od_driver.chart_drag_payload(), "", "no payload at the centre")
+        }
+        spec.it("un-arms when nothing is hovered (outside the rings)") callback {
+            od_driver.hover_chart_vb(3.0, 3.0)
+            spec.assert_str_eq(od_driver.chart_drag_payload(), "", "no payload in the white corner")
+        }
+        spec.it("re-arms when moving from empty space back onto a segment") callback {
+            od_driver.hover_chart_vb(3.0, 3.0)
+            spec.assert_str_eq(od_driver.chart_drag_payload(), "", "un-armed first")
+            a = od_driver.hover_segment("Documents", 1)
+            spec.assert_true(a >= 0.0, "Documents found on ring 1")
+            spec.assert_contains(od_driver.chart_drag_payload(), "Documents", "armed again")
+        }
+    }
+    return spec.run_summary(fw)
+}

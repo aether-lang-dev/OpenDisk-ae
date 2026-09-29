@@ -17,7 +17,7 @@ exports (
     click_row, crumbs_line, wait_crumbs, text_containing, wait_text, canvas_id,
     chart_a11y, hover_chart_vb, hover_segment, click_segment_named, click_chart_centre,
     chart_px_x, chart_px_y, collector_title, collector_sub, widget_visible, button_starting,
-    chart_rgb
+    chart_rgb, chart_drag_payload
 )
 
 import std.string
@@ -270,6 +270,19 @@ chart_a11y() -> string {
     v, _e = json.parse(body)
     if v == null { return "" }
     d = jstr(v, "description")
+    json.json_free(v)
+    return d
+}
+
+// The canvas widget's current drag payload ("" when not armed — see
+// od_app.ae's update_chart_drag). The general /widget/{id} route reports it
+// as a "drag" field whenever ui.draggable() has been called with a
+// non-empty path, same JSON shape as any other draggable widget.
+chart_drag_payload() -> string {
+    body = uidriver.get_body("/widget/${canvas_id()}")
+    v, _e = json.parse(body)
+    if v == null { return "" }
+    d = jstr(v, "drag")
     json.json_free(v)
     return d
 }

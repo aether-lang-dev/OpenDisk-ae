@@ -643,9 +643,28 @@ chart_move(a: *App, x: float, y: float) {
             if s == null { _d = a11y_description(a.cwid, "") }
             else { _d2 = a11y_description(a.cwid, describe_seg(a, s)) }
         }
+        update_chart_drag(a, s)
     } else {
         if s != null { a.dirty = 1 }    // the tip follows the pointer
     }
+}
+
+// Keeps the chart canvas's drag payload current with whatever's hovered.
+// ui.draggable reads the payload live at drag-start (not when armed), so
+// updating it here on every hover change means a drag that starts
+// mid-gesture always picks up the segment the pointer is actually over.
+// The centre ring (depth 0, "go back") and nothing hovered both un-arm it
+// (empty payload — ui.draggable's own way to say "not a drag source
+// right now"). Re-arming with a new payload is a cheap no-op backend-side.
+update_chart_drag(a: *App, s: *Seg) {
+    if a.cwid == 0 { return }
+    path = ""
+    if s != null {
+        if s.depth > 0 {
+            if string.length(s.path) > 0 { path = s.path }
+        }
+    }
+    ui.draggable(a.cwid, path)
 }
 
 // Click: the centre goes back; a folder opens; a file does nothing.

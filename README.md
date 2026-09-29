@@ -76,7 +76,7 @@ writable directory: `ae run` caches compiled binaries there.
 | FSEvents rescan trigger (macOS scan cache not ported — see "Where it differs") | `opendisk/od_watch.ae` seam, `watch_mac`/`watch_none` | `test/test_watch.sh` |
 | Finder capacity, Quick Look, Trash, NSWorkspace, Full Disk Access probe | `opendisk/od_native.ae` seam, `native_mac`/`native_none` | `test/test_native.sh` |
 | `ChartItem`, `RingsChartLayout`, `ChartPalette` | `opendisk/od_chart.ae` | `test/test_chart.ae` |
-| `RingsChartView`, `ChartHoverTip` | `opendisk/od_draw.ae` | `spec/spec_chart.ae` |
+| `RingsChartView`, `ChartHoverTip` | `opendisk/od_draw.ae` | `spec/spec_chart.ae`, `spec/spec_chart_drag.ae` |
 | `SearchIndex` | `od_search.ae`, `od_text.c` | `test/test_search.ae`, `spec/spec_search.ae` |
 | `Collector` | `od_collector.ae` | `test/test_collector.ae`, `spec/spec_collector.ae` |
 | `ProtectedPaths` | `od_protected.ae` (macOS, plus Linux and Windows rules) | `test/test_protected.ae` |
@@ -135,9 +135,14 @@ The constants and strings are OpenDisk's own:
   updates and sandbox bookmarks. The last is replaced by *Recent Folders*:
   folders you scanned before, stored in the OS's config directory
   (`$OPENDISK_CONFIG_DIR` overrides it).
-- **Dragging from the chart is not ported.** The canvas has no drag source. The
-  chart's context menu offers *Add to Collector* instead. List rows do drag,
-  and a drop anywhere on the window collects.
+- **Dragging from the chart is ported.** The canvas is a real drag source
+  (`ui.draggable`, aether-ui's generic handle-based drag API — untested on a
+  canvas anywhere in aether-ui before this): hovering a segment keeps the
+  canvas armed with that item's path, live, so a drag started mid-gesture
+  always carries whatever's actually under the pointer (`chart_move` /
+  `update_chart_drag` in `od_app.ae`). The centre ring ("go back") and empty
+  space both un-arm it. The chart's context menu still offers *Add to
+  Collector* too, same as a list row does alongside its own drag.
 - **The Collector's list is always visible** under the chart, rather than
   OpenDisk's hover pop-up.
 - **Search name folding** is lowercase plus composed Latin accents (`od_text.c`),
