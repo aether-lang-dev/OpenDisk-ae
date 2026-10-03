@@ -7,12 +7,11 @@
 // is aether-ui's own, never a copy here that could drift from it.
 import bldr
 import aether
-import aether (source, output, no_closure_regen, lib, extra_source)
+import aether (source, output, no_closure_regen, lib)
 import build_support.aetherui (ui_backend)
 import std.os (platform)
 import std.os
 import std.string
-import std.fs (mkdir_p)
 
 main() {
     bldr.build() {
@@ -22,10 +21,10 @@ main() {
             source("opendisk.ae")
             output("opendisk")
             lib(ui)
-            // The C the od_stat / od_text modules ship via @source: `ae run`
-            // compiles it in on its own, aeb's link needs it named.
-            extra_source("od_stat.c")
-            extra_source("od_text.c")
+            // The C and ObjC the modules ship via @source (od_stat, od_text,
+            // macae's) need no naming here: aeb compiles every imported
+            // module's @source into the link, the ObjC apart and without
+            // aether-ui's -fobjc-arc (aeb a74bf8f and its follow-up).
             no_closure_regen()
             ui_backend(ui)
             // od_app.ae imports `od_watch` unconditionally; exactly one of
@@ -42,44 +41,12 @@ main() {
                 lib("${root}/macae")
                 lib("${root}/opendisk/watch_mac")
                 lib("${root}/opendisk/native_mac")
-                // extra_source/link_flag opt aether.program() onto the manual
-                // aetherc+gcc path (already true here for od_stat.c/od_text.c),
-                // which does not auto-discover an imported module's own
-                // @source/@link the way a plain `ae build` shell-out would —
-                // so each macae module's C/ObjC half and any framework not
-                // already linked by ui_backend need naming here, same as
-                // od_stat.c/od_text.c above. Foundation, AppKit and ImageIO
-                // are already linked by ui_backend's own darwin branch.
-                extra_source("${root}/macae/mac/fsevents/fsevents.c")
-                extra_source("${root}/macae/mac/volume/volume.m")
-                extra_source("${root}/macae/mac/trash/trash.m")
-                extra_source("${root}/macae/mac/fda/fda.c")
+                // Frameworks the macae modules' own @link lines also name
+                // (aeb reads those too); naming them twice is harmless.
                 link_flag("-Wl,-framework,CoreServices")
                 link_flag("-Wl,-framework,Quartz")
                 link_flag("-Wl,-framework,QuickLookThumbnailing")
                 link_flag("-Wl,-framework,CoreGraphics")
-
-                // quicklook.m and workspace.m call retain/release/autorelease
-                // directly (macae is deliberately non-ARC — see
-                // macae/AGENTS.md), which conflicts with aether-ui's own
-                // -fobjc-arc (its AppKit backend needs it, set by ui_backend
-                // above). aeb's manual link path compiles every extra_source
-                // in ONE clang invocation sharing ONE flag set, so ARC and
-                // non-ARC .m files can't both be extra_source in this build.
-                // Precompile just these two to plain .o objects with
-                // -fno-objc-arc here, then link the objects directly — a
-                // bare path in link_flag is just another positional input
-                // to the final clang command, same as any .o would be.
-                _native_obj_dir = "${root}/opendisk/.build_native"
-                mkdir_p(_native_obj_dir)
-                _ql_o = "${_native_obj_dir}/quicklook.o"
-                _ws_o = "${_native_obj_dir}/workspace.o"
-                _ql_rc = os.system("clang -c -O2 -fno-objc-arc -o ${_ql_o} ${root}/macae/mac/quicklook/quicklook.m")
-                if _ql_rc != 0 { bldr.fail("precompiling macae's quicklook.m (non-ARC) failed, rc=${_ql_rc}") }
-                _ws_rc = os.system("clang -c -O2 -fno-objc-arc -o ${_ws_o} ${root}/macae/mac/workspace/workspace.m")
-                if _ws_rc != 0 { bldr.fail("precompiling macae's workspace.m (non-ARC) failed, rc=${_ws_rc}") }
-                link_flag(_ql_o)
-                link_flag(_ws_o)
             } else {
                 lib("${root}/opendisk/watch_none")
                 lib("${root}/opendisk/native_none")

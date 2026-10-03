@@ -35,9 +35,11 @@ so it doesn't need to exist there. See [macae](https://github.com/aether-lang-de
 if you don't have a sibling checkout yet — `mac.fsevents`, `mac.volume`,
 `mac.quicklook`, `mac.trash`, `mac.workspace` and `mac.fda` are used today.
 
-The port needs Aether ≥ 0.717.0, which carries three fixes it relies on (a
-trailing block on a struct-field assignment; `_` bound inside a loop;
-`fs.hard_link`, used by the tests).
+The port builds against Aether ≥ 0.766.0, the floor shared by the whole Aether
+family (the code itself needs 0.717.0: a trailing block on a struct-field
+assignment; `_` bound inside a loop; `fs.hard_link`, used by the tests), and
+aeb v0.325 or later, which compiles the modules' `@source` C and Objective-C
+into the link itself.
 
 ## Build, run, test
 
