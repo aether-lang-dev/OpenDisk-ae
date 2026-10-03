@@ -72,12 +72,18 @@ main() {
             _r = fs.remove_tree(d)
         }
         spec.it("refuses a protected path with a notice and no undo step") callback {
+            // A protected path that exists on every host: the home folder,
+            // here a temp dir standing in for it. (/System was the case, but
+            // add() refuses a missing path silently before the protected rule
+            // runs, and /System exists only on macOS.)
+            home = fresh_dir("home")
             c = collector_new()
-            set_rules(c, "macos", "/Users/alice")
-            spec.assert_eq(add(c, item_new("/System", 1, 1)), 0, "refused")
-            spec.assert_contains(notice(c), "System", "notice names it")
+            set_rules(c, "macos", home)
+            spec.assert_eq(add(c, item_new(home, 1, 1)), 0, "refused")
+            spec.assert_contains(notice(c), "home folder", "notice says what it is")
             spec.assert_contains(notice(c), "can't be deleted", "and says why")
             spec.assert_false(can_undo(c), "no undo step")
+            _r = fs.remove_tree(home)
         }
         spec.it("refuses synthetic and missing paths silently") callback {
             c = collector()

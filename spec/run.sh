@@ -37,6 +37,15 @@ make_fixture() {
     head -c 10      /dev/urandom > "$f/tiny.txt"
 }
 
+# Stop the app. Under OD_XVFB=1, $pid is the xvfb-run wrapper and the app is
+# its child: killing only the wrapper orphaned the app, which kept port 9222
+# and failed every later spec with "already answering". Children first.
+stop_app() {
+    pkill -P "$1" 2>/dev/null
+    kill "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+}
+
 fail=0
 for s in "${SPECS[@]}"; do
     work="$(mktemp -d "${TMPDIR:-/tmp}/od-spec-XXXXXX")"
@@ -66,12 +75,12 @@ for s in "${SPECS[@]}"; do
     done
     if [ "$up" -ne 1 ]; then
         echo "  FAIL opendisk_$s — app never answered"; tail -5 "$work/app.log"
-        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        stop_app "$pid"
         fail=$((fail + 1)); rm -rf "$work"; continue
     fi
     out="$(cd "$SPEC_DIR" && OD_FIXTURE="$fix" AETHER_LIB_DIR="$LIBT" ae run "spec_${s}.ae" 2>&1)"
     rc=$?
-    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    stop_app "$pid"
     pass="$(printf '%s\n' "$out" | grep -a -o '[0-9]* passing' | tail -1)"
     if [ "$rc" -eq 0 ] && ! printf '%s\n' "$out" | grep -aq 'failing'; then
         echo "  OK   opendisk_$s (${pass:-?})"

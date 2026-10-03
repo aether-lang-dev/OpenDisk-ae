@@ -10,11 +10,19 @@
 import std.spec
 import std.string
 import std.fs
+import std.os
 import od_driver
 import uidriver
 
 main() {
     fw = spec.init()
+    // The watcher is macOS's FSEvents (opendisk/watch_mac); elsewhere the build
+    // links the stub (watch_none), whose watch_available() is 0, so there is
+    // nothing to pick a change up. Same platform gate as opendisk/.build.ae.
+    if spec.skip_all_if(fw, string.equals(os.platform(), "darwin") == 0,
+                        "no filesystem watcher on this platform (od_watch is the stub)") == 1 {
+        return spec.run_summary(fw)
+    }
     od_driver.wait_for_app()
     fix = od_driver.fixture_path()
 
