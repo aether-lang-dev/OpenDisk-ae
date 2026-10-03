@@ -523,9 +523,19 @@ navigate_to(a: *App, path: string) {
     } else {
         _ = strarr.push_copy(a.back, a.current)
     }
-    a.current = path
+    // A copy: `path` is borrowed from a row, a chart segment or a crumb, and
+    // refresh() below rebuilds those, freeing it. Stored as-is, a.current
+    // dangled, and the next rescan (Ctrl+R) handed garbage to
+    // mac.volume, which crashed in NSURL.
+    a.current = own_path_(path)
     a.hovered = null as *Seg
     refresh(a)
+}
+
+// An owned copy of a path, for storing in the App: a path from a row, a
+// segment or the history list goes when those are rebuilt.
+own_path_(p: string) -> string {
+    return string.concat(p, "")
 }
 
 go_back(a: *App) {
@@ -539,7 +549,8 @@ go_back(a: *App) {
         j = j + 1
     }
     a.back = nb
-    a.current = prev
+    // A copy, for the same reason: prev belongs to the history list.
+    a.current = own_path_(prev)
     a.hovered = null as *Seg
     refresh(a)
 }
@@ -715,6 +726,12 @@ chart_click(a: *App, x: float, y: float) {
 // ─── The Collector ────────────────────────────────────────────────
 
 size_of_path(a: *App, p: string) -> *Item {
+    // Resolve as start_analysis resolves the root: the tree's paths are
+    // realpath'd (/var -> /private/var on macOS) and a dropped path is not,
+    // so a folder dropped from the tree missed node_for_path and was
+    // counted as its directory entry (96 bytes) instead of its contents.
+    rp, _kind, rerr = fs.realpath(p)
+    if string.length(rerr) == 0 { p = rp }
     if a.root != null {
         n = node_for_path(a.root, p)
         if n != null { return item_new(p, n.size, n.is_dir) }
