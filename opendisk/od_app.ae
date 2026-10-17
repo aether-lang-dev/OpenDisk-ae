@@ -9,7 +9,7 @@
 exports (
     App, app_new, now_s, start_analysis, begin_scan, tick, refresh, refresh_devices,
     navigate_to, go_back, row_clicked, set_query, toggle_sort, collect_paths,
-    collect_row, collect_hovered, uncollect, undo_collect, ask_delete, confirm_delete,
+    collect_path, collect_hovered, uncollect, undo_collect, ask_delete, confirm_delete,
     cancel_delete, ask_unmount, confirm_unmount, cancel_unmount, chart_move, chart_click,
     open_path, reveal_path, copy_path, rescan, row_at_index, sort_label,
     show_picker, scan_folder, chart_paint, quick_look_path, open_fda_settings, VB
@@ -768,10 +768,9 @@ collect_paths(a: *App, paths: ptr) {
     refresh(a)
 }
 
-collect_row(a: *App, r: *Row) {
-    if r == null { return }
+collect_path(a: *App, p: string) {
     one = strarr.new()
-    _ = strarr.push_copy(one, r.path)
+    _ = strarr.push_copy(one, p)
     collect_paths(a, one)
 }
 

@@ -107,8 +107,13 @@ main() {
             _hf2 = set_hidden(a.fda_btn, 1)
             a.devices = each("v", 6) callback |item: ptr, i: int, parent: int| {
                 d = item as *Device
+                // The closures take the device's values, not `item`: it is
+                // the each()'s element, borrowed for this call only.
+                dpath = d.path
+                dname = d.name
+                dused = d.used
                 row = hstack(parent, 10)
-                _go = btn(row, d.name) callback { od_app.start_analysis(a, d.path, d.name, d.used) }
+                _go = btn(row, dname) callback { od_app.start_analysis(a, dpath, dname, dused) }
                 if d.total > 0 {
                     _u = text(row, "${od_fmt.decimal_no_fraction(d.used)} / ${od_fmt.decimal_no_fraction(d.total)}")
                     pb = progressbar(row, od_devices.used_fraction(d))
@@ -118,12 +123,14 @@ main() {
             a.recents_title = text("Recent Folders")
             a.recents = each("v", 6) callback |item: ptr, i: int, parent: int| {
                 d = item as *Device
+                dpath = d.path
+                dname = d.name
                 row = hstack(parent, 10)
-                _go = btn(row, d.name) callback { od_app.start_analysis(a, d.path, d.name, 0) }
-                loc = text(row, d.path)
+                _go = btn(row, dname) callback { od_app.start_analysis(a, dpath, dname, 0) }
+                loc = text(row, dpath)
                 text_truncate(loc, "middle")
                 context_menu_item(row, "Remove from List") callback {
-                    od_recent_remove(a, d.path)
+                    od_recent_remove(a, dpath)
                 }
             }
             hstack(8) {
@@ -193,8 +200,7 @@ main() {
                             // drag a row out (into the Collector, or another app)
                             if od_view.is_synthetic(r.path) == 0 { draggable(row, r.path) }
                             rp = r.path
-                            rr = r
-                            context_menu_item(row, "Add to Collector") callback { od_app.collect_row(a, rr) }
+                            context_menu_item(row, "Add to Collector") callback { od_app.collect_path(a, rp) }
                             if od_view.is_synthetic(rp) == 0 {
                                 context_menu_item(row, "Open") callback { od_app.open_path(a, rp) }
                                 context_menu_item(row, "Quick Look") callback { od_app.quick_look_path(a, rp) }
