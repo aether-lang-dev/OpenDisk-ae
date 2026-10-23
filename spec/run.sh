@@ -21,7 +21,7 @@ LIBT="$ROOT/aether-ui/tests/lib"
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) command -v cygpath >/dev/null 2>&1 && LIBT="$(cygpath -m "$LIBT")" ;;
 esac
-PORT=9222
+PORT=${AETHER_UI_TEST_PORT:-9222}
 SPECS=(scan_list chart chart_drag search collector picker incremental_rescan)
 [ $# -gt 0 ] && SPECS=("$@")
 export AETHER_UI_NO_ANIMATION=1

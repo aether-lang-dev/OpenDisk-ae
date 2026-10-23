@@ -63,7 +63,7 @@ import std.string
 import std.list
 import std.strarr
 import std.os
-import std.os (os_getenv, aether_args_count, aether_args_get)
+import std.os (os_getenv, args_count, args_get)
 import od_app
 import od_app (App, app_new, VB)
 import od_view
@@ -83,7 +83,7 @@ main() {
     a.now = od_app.now_s()
 
     start = ""
-    if aether_args_count() > 1 { start = aether_args_get(1) }
+    if args_count() > 1 { start = args_get(1) }
     if string.length(start) == 0 {
         e = os_getenv("OPENDISK_SCAN")
         if e != null { start = e }
